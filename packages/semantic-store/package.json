@@ -1,0 +1,6 @@
+{
+  "name": "@codex-session-map/semantic-store",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts"
+}

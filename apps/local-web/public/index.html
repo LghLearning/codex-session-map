@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>Codex Session Map</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">C</span>
+        <div>
+          <h1>Codex Session Map</h1>
+          <p>Turn scattered Codex sessions into an editable semantic forest</p>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <span id="connection-state" class="connection-state">Connecting…</span>
+        <button id="diagnostics-button" class="button secondary" type="button">Diagnostics</button>
+        <button id="refresh-button" class="button primary" type="button">Refresh snapshot</button>
+      </div>
+    </header>
+
+    <section id="environment-check" class="environment-check" aria-label="Local environment status">
+      <span id="environment-version" class="environment-version">v0.1.0-alpha</span>
+      <span id="environment-history">Codex history · Checking</span>
+      <span id="environment-store">Semantic store · Checking</span>
+      <span id="environment-ollama">Ollama · Checking</span>
+      <span id="environment-model">qwen3.5 · Checking</span>
+    </section>
+
+    <main class="explorer" aria-label="Codex session explorer">
+      <nav class="panel scopes-panel" aria-labelledby="scopes-heading">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Level 1</p>
+            <h2 id="scopes-heading">Workspaces</h2>
+          </div>
+          <span id="scope-count" class="count">0</span>
+        </div>
+        <div id="scope-list" class="item-list" role="list"></div>
+      </nav>
+
+      <section class="panel sessions-panel" aria-labelledby="sessions-heading">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Level 2</p>
+            <h2 id="sessions-heading">Sessions</h2>
+          </div>
+          <span id="session-count" class="count">0</span>
+        </div>
+        <div class="session-view-switch" role="group" aria-label="Session view">
+          <button id="session-list-view" class="view-switch-button active" type="button">List</button>
+          <button id="session-forest-view" class="view-switch-button" type="button">Forest</button>
+        </div>
+        <div class="filters">
+          <label class="search-label">
+            <span class="visually-hidden">Filter sessions</span>
+            <input id="session-filter" type="search" placeholder="Filter loaded sessions…" autocomplete="off">
+          </label>
+          <label class="checkbox-label"><input id="show-hidden" type="checkbox"> Include agent sessions</label>
+        </div>
+        <div id="session-list" class="item-list" role="list"></div>
+        <button id="more-sessions" class="load-more" type="button" hidden>Load more sessions</button>
+        <section id="forest-surface" class="forest-surface" aria-label="Editable Session Forest" hidden>
+          <div class="forest-toolbar">
+            <div>
+              <div id="forest-summary" class="forest-summary">Forest not loaded</div>
+              <div id="organize-progress" class="organize-progress" hidden></div>
+            </div>
+            <div class="forest-controls" role="group" aria-label="Forest viewport controls">
+              <button id="organize-workspace" class="button primary" type="button">Organize Workspace</button>
+              <button id="cancel-organize" class="button secondary" type="button" hidden>Cancel</button>
+              <button id="forest-zoom-out" class="button secondary" type="button" aria-label="Zoom out">−</button>
+              <button id="forest-fit" class="button secondary" type="button">Fit</button>
+              <button id="forest-zoom-in" class="button secondary" type="button" aria-label="Zoom in">+</button>
+            </div>
+          </div>
+          <div id="forest-viewport" class="forest-viewport" tabindex="0">
+            <div id="forest-canvas" class="forest-canvas"></div>
+          </div>
+        </section>
+      </section>
+
+      <article class="panel transcript-panel" aria-labelledby="transcript-heading">
+        <div class="transcript-header">
+          <div class="transcript-title-wrap">
+            <p class="eyebrow">Level 3</p>
+            <h2 id="transcript-heading">Select a session</h2>
+            <p id="session-meta" class="session-meta">Turns will appear here without modifying Codex.</p>
+          </div>
+          <div class="transcript-actions">
+            <span id="batch-trace-progress" class="batch-trace-progress" hidden></span>
+            <button id="generate-session-traces" class="button primary" type="button" hidden>Generate missing traces</button>
+            <button id="copy-session-id" class="button secondary" type="button" hidden>Copy session ID</button>
+          </div>
+        </div>
+        <section id="semantic-title-panel" class="semantic-title-panel" aria-label="Semantic Session Title" hidden></section>
+        <section id="semantic-parent-panel" class="semantic-parent-panel" aria-label="Semantic Relationship" hidden></section>
+        <div id="route-notice" class="notice route-notice" hidden></div>
+        <div id="navigation-notice" class="notice" hidden></div>
+        <div id="semantic-preview-notice" class="notice semantic-preview-notice" hidden></div>
+        <div id="transcript-empty" class="empty-state">
+          <div class="empty-glyph" aria-hidden="true">↳</div>
+          <h3>Choose a workspace and session</h3>
+          <p>This view keeps the native transcript intact. Semantic Trace previews are generated only when you request them.</p>
+        </div>
+        <div id="turn-window-controls" class="turn-window-controls" hidden>
+          <button id="previous-turn-window" class="button secondary" type="button">Earlier turns</button>
+          <span id="turn-window-status"></span>
+          <button id="next-turn-window" class="button secondary" type="button">Later turns</button>
+        </div>
+        <div id="turn-list" class="turn-list"></div>
+        <button id="more-turns" class="load-more" type="button" hidden>Load more turns</button>
+      </article>
+    </main>
+
+    <dialog id="diagnostics-dialog" class="diagnostics-dialog">
+      <div class="dialog-heading">
+        <div>
+          <p class="eyebrow">Adapter observability</p>
+          <h2>Diagnostics</h2>
+        </div>
+        <button id="close-diagnostics" class="icon-button" type="button" aria-label="Close diagnostics">×</button>
+      </div>
+      <p class="dialog-help">Upstream inconsistencies remain visible; they are not silently removed from the map.</p>
+      <div id="diagnostic-environment" class="diagnostic-environment"></div>
+      <div id="diagnostic-counts" class="diagnostic-counts"></div>
+      <div id="diagnostic-list" class="diagnostic-list"></div>
+    </dialog>
+
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+    <output id="performance-metrics" hidden></output>
+  </body>
+</html>

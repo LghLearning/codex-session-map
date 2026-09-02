@@ -1,0 +1,3 @@
+{"timestamp":"2025-11-01T00:00:00.000Z","type":"session_meta","payload":{"id":"session-archived","cwd":"C:\\Archive","source":"cli"}}
+{"timestamp":"2025-11-01T00:00:01.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-archived"}}
+{"timestamp":"2025-11-01T00:00:02.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-archived"}}

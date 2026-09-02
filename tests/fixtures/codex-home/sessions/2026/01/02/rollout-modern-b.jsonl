@@ -1,0 +1,5 @@
+{"timestamp":"2026-01-02T00:00:00.000Z","type":"session_meta","payload":{"id":"session-modern","cwd":"C:/Work/Project/.","source":"cli","history_mode":"paginated"}}
+{"timestamp":"2026-01-02T00:00:01.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-second-segment"}}
+{"timestamp":"2026-01-02T00:00:02.000Z","type":"event_msg","payload":{"type":"user_message","message":"Continue in another physical segment."}}
+{"timestamp":"2026-01-02T00:00:03.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Second segment complete."}}
+{"timestamp":"2026-01-02T00:00:04.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-second-segment"}}

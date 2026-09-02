@@ -1,0 +1,23 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .: {}
+
+  apps/local-web: {}
+
+  packages/codex-adapter: {}
+
+  packages/core: {}
+
+  packages/forest: {}
+
+  packages/organizer: {}
+
+  packages/semantic-store: {}
+
+  packages/transcript: {}

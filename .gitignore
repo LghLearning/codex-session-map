@@ -1,0 +1,15 @@
+node_modules/
+.DS_Store
+coverage/
+dist/
+*.log
+.codex-session-map/
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.pem
+*.key

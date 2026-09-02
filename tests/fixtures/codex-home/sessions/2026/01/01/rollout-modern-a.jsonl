@@ -1,0 +1,15 @@
+{"timestamp":"2026-01-01T00:00:00.000Z","type":"session_meta","payload":{"id":"session-modern","cwd":"\\\\?\\C:\\Work\\Project","source":"cli","history_mode":"paginated"}}
+{"timestamp":"2026-01-01T00:00:01.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-completed"}}
+{"timestamp":"2026-01-01T00:00:02.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Inspect the fixture."}]}}
+{"timestamp":"2026-01-01T00:00:03.000Z","type":"response_item","payload":{"type":"function_call","name":"read_file","call_id":"call-1","arguments":"{\"path\":\"fixture.txt\"}"}}
+{"timestamp":"2026-01-01T00:00:04.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"fixture output"}}
+{"timestamp":"2026-01-01T00:00:05.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Fixture inspected."}]}}
+{"timestamp":"2026-01-01T00:00:06.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-completed","last_agent_message":"Fixture inspected."}}
+{"timestamp":"2026-01-01T00:01:00.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-interrupted"}}
+{"timestamp":"2026-01-01T00:01:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"Stop this turn."}}
+{"timestamp":"2026-01-01T00:01:02.000Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-interrupted"}}
+{"timestamp":"2026-01-01T00:02:00.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-failed"}}
+{"timestamp":"2026-01-01T00:02:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"Exercise failure projection."}}
+{"timestamp":"2026-01-01T00:02:02.000Z","type":"event_msg","payload":{"type":"stream_error","turn_id":"turn-failed","status":"failed"}}
+{"timestamp":"2026-01-01T00:02:03.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-failed","status":"failed"}}
+{"timestamp":"2026-01-01T00:03:00.000Z","type":"future_event","payload":{"schema":99}}

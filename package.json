@@ -1,0 +1,27 @@
+{
+  "name": "codex-session-map",
+  "version": "0.1.0-alpha",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.19.0",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "test": "node --test packages/core/test/invariants.test.ts packages/codex-adapter/test/adapter-fixtures.test.ts packages/codex-adapter/test/app-server-client.test.ts packages/codex-adapter/test/path-canonicalizer.test.ts packages/codex-adapter/test/realtime-soak.test.ts packages/codex-adapter/test/rollout-decoder.test.ts packages/codex-adapter/test/sqlite-source.test.ts packages/codex-adapter/test/update-monitor.test.ts packages/semantic-store/test/ollama-client.test.ts packages/semantic-store/test/semantic-safety.test.ts packages/semantic-store/test/semantic-trace.test.ts packages/semantic-store/test/session-title.test.ts packages/semantic-store/test/semantic-parent.test.ts packages/forest/test/materialize.test.ts packages/organizer/test/organize.test.ts packages/transcript/test/projection.test.ts apps/local-web/test/navigation-state.test.ts apps/local-web/test/server.test.ts apps/local-web/test/transcript-window.test.ts scripts/check-node-version.test.mjs tests/read-only-contract.test.ts",
+    "start": "node apps/local-web/src/main.ts",
+    "start:fallback": "node apps/local-web/src/main.ts --no-app-server",
+    "start:windows": "powershell -ExecutionPolicy Bypass -File ./start-session-map.ps1",
+    "inspect": "node apps/local-web/src/inspect.ts",
+    "inspect:fallback": "node apps/local-web/src/inspect.ts --no-app-server",
+    "benchmark:transcript": "node scripts/benchmark-transcripts.ts",
+    "benchmark:reconciliation": "node scripts/benchmark-reconciliation.ts",
+    "evaluate:local-traces": "node scripts/evaluate-local-traces.ts",
+    "regress:trace-safety": "node scripts/regress-local-trace-safety.ts",
+    "check:readonly": "node tests/read-only-contract.test.ts"
+  }
+}

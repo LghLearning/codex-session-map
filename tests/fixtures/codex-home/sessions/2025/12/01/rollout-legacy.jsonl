@@ -1,0 +1,5 @@
+{"timestamp":"2025-12-01T00:00:00.000Z","type":"session_meta","payload":{"id":"session-legacy","cwd":"C:\\Legacy","source":"cli"}}
+{"timestamp":"2025-12-01T00:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Legacy input."}]}}
+{"timestamp":"2025-12-01T00:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Legacy output."}]}}
+{"timestamp":"2025-12-01T00:01:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Second legacy input."}]}}
+{"timestamp":"2025-12-01T00:01:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Second legacy output."}]}}
