@@ -3,13 +3,13 @@ import type { NativeLineage, Session } from "../../core/src/index.ts";
 export type ForestSemanticRelation = "continuation" | "subtask" | "root";
 
 export interface ForestSemanticTitleInput {
-  readonly generatedTitle: string;
+  readonly generatedTitle?: string;
   readonly userTitle?: string;
 }
 
 export interface ForestSemanticParentInput {
   readonly generatedParentSessionId?: string;
-  readonly generatedRelation: ForestSemanticRelation;
+  readonly generatedRelation?: ForestSemanticRelation;
   readonly userParentSessionId?: string;
   readonly userRelation?: ForestSemanticRelation;
 }
@@ -151,8 +151,8 @@ function preferredPlacement(edge: ForestSemanticParentInput | undefined): {
   };
   return {
     parentSessionId: edge.generatedRelation === "root" ? undefined : edge.generatedParentSessionId,
-    relation: edge.generatedRelation,
-    source: "ai",
+    relation: edge.generatedRelation ?? "root",
+    source: edge.generatedRelation ? "ai" : "none",
   };
 }
 

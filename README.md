@@ -21,7 +21,8 @@ Codex history remains read-only. AI metadata and user corrections are stored loc
 - Generates stable Session titles and continuation/subtask/root relationships.
 - Organizes one explicitly selected Workspace into a multi-root Forest.
 - Keeps Unorganized Sessions separate from confirmed semantic Roots.
-- Lets the user edit titles, change parents, or confirm a Session as Root.
+- Lets the user rename Sessions, edit Turn labels, change parents, or set a Session as Root without generating AI suggestions first.
+- Supports Restore automatic and revision-protected Undo for manual edits.
 - Preserves the original transcript beside all generated metadata.
 
 Native Lineage records how Codex Sessions were created. Semantic placement records how those Sessions relate as work. They remain separate.
@@ -33,7 +34,17 @@ Native Lineage records how Codex Sessions were created. Semantic placement recor
 - A local Codex installation with existing Session history.
 - Optional for AI generation: [Ollama](https://ollama.com/) and `qwen3.5`.
 
-History browsing and existing Forest data remain available when Ollama is offline.
+History browsing, Forest data, and manual organization remain available when Ollama is offline. Only AI generation requires the model.
+
+## Recent updates
+
+- Full Turn content now preserves long text, whitespace, and formatting independently of bounded previews. Displayed Turn numbers remain consecutive across pagination, and native Turn IDs support exact reads.
+- Derived fingerprints detect full-content changes, including text outside AI prompt samples. Older cached suggestions may appear stale after upgrading; stored suggestions and user values are retained.
+- User titles, Turn labels, and parent placement are persisted independently of AI records. Manual parent selection covers all legal Sessions in the Workspace, with time-direction and cycle checks.
+- Undo checks the current revision before restoring a previous user value. Restore automatic clears an override while retaining the AI suggestion. Ctrl+Z inside text inputs keeps the browser's text-editing behavior.
+- Forest trace content and counts update as generation completes, without reloading the page. Trace cards now follow the active color theme.
+
+Restart the server after updating. The application upgrades its local semantic database from schema 4 to 5 transactionally, preserving existing user titles, parent choices, trace edits, and review states. No Codex source database is modified.
 
 ## Installation
 
@@ -80,7 +91,7 @@ The default URL is `http://127.0.0.1:4319`.
 2. Open **Forest**.
 3. Click **Organize Workspace**.
 4. Review the generated titles and relationships.
-5. Use **Edit title**, **Change parent**, or **Set root** to correct mistakes.
+5. Use **Rename**, **Edit label**, **Change parent**, or **Set root** to organize directly, even without AI results. **Restore automatic** clears your override; **Undo** reverses your recent manual change.
 
 Organization is explicit, current-Workspace-only, cancellable, and safe to rerun. It reuses existing titles and parents, preserves user corrections, continues after individual Session failures, and never starts full-history Turn Trace generation.
 
@@ -139,12 +150,12 @@ Filesystem watchers reduce update latency. Periodic reconciliation remains the c
 - Codex currently reports `openSession=false` and `openTurn=false`; the companion transcript and Copy Session ID are the supported fallback.
 - Semantic Parent inference can fail closed when the model returns a Session outside the candidate set. Rerunning retries only missing records.
 - Reparenting uses a dialog rather than drag-and-drop.
-- Manual Parent correction currently requires a stored AI Parent result. Failed/missing results remain explicitly Unorganized; they are not silently labeled Root.
-- When Ollama is offline, stored Traces, Titles, relationships, and user corrections remain readable/editable. Generation is disabled; restart after restoring Ollama to enable it again.
+- Sessions without an AI or user placement remain explicitly Unorganized; they are not silently treated as user-confirmed Roots.
+- When Ollama is offline, manual titles, labels, relationships, and Undo remain available. Generation is disabled; restart after restoring Ollama to enable it again.
 - Large cold Workspace materialization can take several seconds.
 - Workspace organization does not generate missing Turn Traces.
 - Non-Windows watcher behavior is unverified.
-- Known UI issue: after generating Session Traces, the Forest may retain its old Trace count/expanded content. Reload the browser page to see stored Traces; repeated generation reuses current records.
+- Undo history starts with edits made through the new manual controls; pre-upgrade actions are not reconstructed as undoable history.
 
 ## Development
 

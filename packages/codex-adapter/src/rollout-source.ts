@@ -270,7 +270,7 @@ function projectRolloutTurns(sessionId: string, segments: readonly Segment[], di
           const turn = ensureTurn(stringValue(payload.turn_id) ?? currentId ?? recoveredTurnId(segment.path, record.ordinal), time, true);
           turn.status = /fail|error/i.test(String(payload.status ?? "")) ? "failed" : "completed";
           turn.completedAtMs = time;
-          turn.assistantFinal = compactText(payload.last_agent_message) ?? turn.assistantFinal;
+          turn.assistantFinal = stringValue(payload.last_agent_message) ?? turn.assistantFinal;
           currentId = undefined;
           currentIsNative = false;
         } else if (eventType === "turn_aborted" || eventType === "task_aborted") {
@@ -282,11 +282,11 @@ function projectRolloutTurns(sessionId: string, segments: readonly Segment[], di
         } else if (eventType === "user_message") {
           const current = currentId ? turns.get(currentId) : undefined;
           const turn = currentId && (currentIsNative || !current?.inputText) ? ensureTurn(currentId, time, false) : startLegacy(segment.path, record, time);
-          turn.inputText = compactText(payload.message ?? payload.text) ?? turn.inputText;
+          turn.inputText = stringValue(payload.message ?? payload.text) ?? turn.inputText;
           turn.initiator = "user";
         } else if (eventType === "agent_message") {
           const turn = ensureTurn(currentId ?? recoveredTurnId(segment.path, record.ordinal), time, true);
-          turn.assistantFinal = compactText(payload.message ?? payload.text) ?? turn.assistantFinal;
+          turn.assistantFinal = stringValue(payload.message ?? payload.text) ?? turn.assistantFinal;
         } else if (/error|failed/.test(eventType)) {
           const turn = ensureTurn(currentId ?? recoveredTurnId(segment.path, record.ordinal), time, true);
           turn.status = "failed";
@@ -377,11 +377,11 @@ function projectResponseItem(payload: Record<string, unknown>, turn: MutableTurn
 }
 
 function messageContent(content: unknown): string | undefined {
-  if (typeof content === "string") return compactText(content);
+  if (typeof content === "string") return stringValue(content);
   if (!Array.isArray(content)) return undefined;
   const parts: string[] = [];
   for (const part of content) if (isRecord(part)) {
-    const text = compactText(part.text ?? part.input_text ?? part.output_text);
+    const text = stringValue(part.text ?? part.input_text ?? part.output_text);
     if (text) parts.push(text);
   }
   return parts.length ? parts.join("\n") : undefined;

@@ -93,6 +93,14 @@ export class CodexAdapterV1 implements SessionProvider, LiveSessionProvider {
   }
 
   async listTurns(sessionId: string, cursor?: string): Promise<Page<Turn>> {
+    return page(await this.#readTurns(sessionId), cursor, this.#options.pageSize ?? 100);
+  }
+
+  async readTurn(sessionId: string, nativeTurnId: string): Promise<Turn | undefined> {
+    return (await this.#readTurns(sessionId)).find((turn) => turn.nativeTurnId === nativeTurnId);
+  }
+
+  async #readTurns(sessionId: string): Promise<readonly Turn[]> {
     await this.#ensureLoaded();
     const record = this.#state!.records.get(sessionId);
     if (!record) throw new Error(`Unknown Codex session: ${sessionId}`);
@@ -106,8 +114,7 @@ export class CodexAdapterV1 implements SessionProvider, LiveSessionProvider {
     }
     if (!turns.length && this.#structured) turns = await this.#structured.listTurns(sessionId);
     if (!turns.length && this.#rollout) turns = await this.#rollout.listTurns(sessionId, record.rolloutPaths);
-    const projected = turns.map(projectTurn);
-    return page(projected, cursor, this.#options.pageSize ?? 100);
+    return turns.map(projectTurn);
   }
 
   async getNativeLineage(sessionId: string): Promise<NativeLineage | null> {

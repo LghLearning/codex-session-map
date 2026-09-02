@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -25,6 +26,29 @@ test("semantic fingerprints ignore display/provenance changes but detect public 
   };
   assert.equal(semanticInputFingerprint(sourceChanged), semanticInputFingerprint(base));
   assert.notEqual(semanticInputFingerprint({ ...base, assistantFinal: "A changed public outcome." }), semanticInputFingerprint(base));
+});
+
+test("full-content fingerprints detect tail and formatting changes and stale pre-A traces", async () => {
+  const store = new SqliteSemanticTraceStore();
+  const base = { ...fixtureTurn(), assistantFinal: `${"背景内容。".repeat(200)}\n结论 A` };
+  const service = new TurnSemanticTraceService({ store, generator: generator("full-content", "1", "完整来源摘要。") });
+  const saved = await service.ensure(base);
+  const changed = { ...base, assistantFinal: `${"背景内容。".repeat(200)}\n结论 B` };
+  assert.equal((await service.inspect(changed)).freshness, "stale");
+  assert.equal((await service.inspect({ ...base, assistantFinal: base.assistantFinal.replace("\n", "  ") })).freshness, "stale");
+  assert.equal((await service.inspect({ ...base, displayOrdinal: 999 })).freshness, "current");
+  const legacyFingerprint = createHash("sha256").update(JSON.stringify({
+    initiatorKind: base.initiatorKind,
+    status: base.status,
+    input: base.input,
+    assistantFinal: base.assistantFinal,
+    tools: base.tools.map((tool) => ({ callId: tool.callId, name: tool.name, status: tool.status, inputSummary: tool.inputSummary, outputSummary: tool.outputSummary })),
+    partial: base.partial,
+  })).digest("hex");
+  await store.put({ ...saved, inputFingerprint: legacyFingerprint });
+  assert.equal((await service.inspect(base)).freshness, "stale", "the pre-A fingerprint format is invalidated without deleting records");
+  assert.equal((await store.get(base))?.text, saved.text);
+  await store.close();
 });
 
 test("trace service is idempotent and invalidates on input or generator version change", async () => {
@@ -99,7 +123,7 @@ test("SQLite store preserves authoritative feedback across AI regeneration and r
 
   const reopened = new SqliteSemanticTraceStore(path);
   const traces = await reopened.listSession(turn.providerId, turn.sessionId);
-  assert.equal(reopened.schemaVersion, 4);
+  assert.equal(reopened.schemaVersion, 5);
   assert.equal(traces.length, 1);
   assert.equal(traces[0]?.text, "A regenerated AI trace.");
   assert.deepEqual(await reopened.getUserFeedback(turn), {
@@ -137,7 +161,7 @@ test("SQLite store upgrades a version-1 trace cache through the Semantic Parent 
   legacy.close();
 
   const upgraded = new SqliteSemanticTraceStore(path);
-  assert.equal(upgraded.schemaVersion, 4);
+  assert.equal(upgraded.schemaVersion, 5);
   assert.equal((await upgraded.get(fixtureTurn()))?.text, "旧版缓存轨迹。");
   assert.equal(await upgraded.getUserFeedback(fixtureTurn()), undefined);
   assert.equal(await upgraded.getSessionTitle(fixtureTurn().providerId, fixtureTurn().sessionId), undefined);

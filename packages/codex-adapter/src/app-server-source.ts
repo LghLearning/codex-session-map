@@ -147,7 +147,7 @@ function projectAppServerThread(value: Record<string, unknown>, archived: boolea
 
 export function projectAppServerTurns(sessionId: string, values: readonly unknown[]): CodexTurnRecord[] {
   const result: CodexTurnRecord[] = [];
-  for (const [index, raw] of values.entries()) {
+  for (const raw of values) {
     if (!isRecord(raw)) continue;
     const turnId = stringValue(raw.id) ?? stringValue(raw.turnId);
     if (!turnId) continue;
@@ -156,7 +156,7 @@ export function projectAppServerTurns(sessionId: string, values: readonly unknow
     result.push({
       sessionId,
       turnId,
-      ordinal: index + 1,
+      ordinal: result.length + 1,
       status: statusValue(raw.status),
       initiator: projected.inputText || projected.attachments.length ? "user" : "agent",
       inputText: projected.inputText,
@@ -182,8 +182,8 @@ function projectItems(items: readonly unknown[]) {
   for (const item of items) {
     if (!isRecord(item)) continue;
     const type = stringValue(item.type) ?? "";
-    if (/userMessage/i.test(type)) inputText = contentText(item.content) ?? compactText(item.text) ?? inputText;
-    else if (/agentMessage|assistantMessage/i.test(type)) assistantFinal = contentText(item.content) ?? compactText(item.text) ?? assistantFinal;
+    if (/userMessage/i.test(type)) inputText = contentText(item.content) ?? stringValue(item.text) ?? inputText;
+    else if (/agentMessage|assistantMessage/i.test(type)) assistantFinal = contentText(item.content) ?? stringValue(item.text) ?? assistantFinal;
     else if (/commandExecution|fileChange|mcpToolCall|dynamicToolCall|toolCall/i.test(type)) {
       const callId = stringValue(item.id) ?? stringValue(item.callId);
       const tool = {
@@ -206,11 +206,11 @@ function projectItems(items: readonly unknown[]) {
 }
 
 function contentText(value: unknown): string | undefined {
-  if (typeof value === "string") return compactText(value);
+  if (typeof value === "string") return stringValue(value);
   if (!Array.isArray(value)) return undefined;
   const parts: string[] = [];
   for (const item of value) if (isRecord(item)) {
-    const text = compactText(item.text ?? item.inputText ?? item.outputText);
+    const text = stringValue(item.text ?? item.inputText ?? item.outputText);
     if (text) parts.push(text);
   }
   return parts.length ? parts.join("\n") : undefined;

@@ -21,6 +21,8 @@ export interface SessionProvider {
   listSessions(scopeId: string, cursor?: string): Promise<Page<Session>>;
   readSession(sessionId: string): Promise<Session>;
   listTurns(sessionId: string, cursor?: string): Promise<Page<Turn>>;
+  /** Reads a full Turn by opaque native ID; undefined means it is absent from the Session. */
+  readTurn?(sessionId: string, nativeTurnId: string): Promise<Turn | undefined>;
   getNativeLineage(sessionId: string): Promise<NativeLineage | null>;
 }
 

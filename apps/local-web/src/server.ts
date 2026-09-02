@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import { extname, resolve, sep } from "node:path";
 import type { NativeLineage, SemanticTraceLookup, Session, SessionProvider, SessionProviderUpdate, Turn, TurnSemanticTrace } from "../../../packages/core/src/index.ts";
 import type { SemanticParentCandidate, SemanticParentEdge, SemanticParentLookup, SemanticParentRelation } from "../../../packages/semantic-store/src/index.ts";
+import { UserEditError, normalizeSemanticSessionTitle, normalizeTraceText, type SqliteSemanticTraceStore, type UserField, type UserValue } from "../../../packages/semantic-store/src/index.ts";
 import type { SessionForest } from "../../../packages/forest/src/index.ts";
 import type { WorkspaceOrganizationProgress, WorkspaceOrganizationResult } from "../../../packages/organizer/src/index.ts";
 import { projectTranscriptTurn } from "../../../packages/transcript/src/index.ts";
@@ -32,6 +33,7 @@ export interface LocalWebServerOptions {
   readonly semanticTitles?: LocalWebSemanticTitles;
   readonly semanticTitleUnavailableReason?: string;
   readonly semanticParents?: LocalWebSemanticParents;
+  readonly userOverrides?: SqliteSemanticTraceStore;
   readonly forest?: LocalWebForest;
   readonly organizer?: LocalWebOrganizer;
   readonly environment?: LocalWebEnvironment;
@@ -66,11 +68,11 @@ export interface LocalWebSemanticTraces {
 }
 
 export interface LocalWebSemanticTitleRecord {
-  readonly generatedTitle: string;
+  readonly generatedTitle?: string;
   readonly userTitle?: string;
-  readonly generator: { readonly id: string; readonly version: string; readonly model?: string };
-  readonly sourceFingerprint: string;
-  readonly generatedAt: string;
+  readonly generator?: { readonly id: string; readonly version: string; readonly model?: string };
+  readonly sourceFingerprint?: string;
+  readonly generatedAt?: string;
   readonly userEditedAt?: string;
 }
 
@@ -156,6 +158,8 @@ export function createLocalWebServer(options: LocalWebServerOptions): {
       if (request.method !== "GET" && request.method !== "HEAD") return sendProblem(response, 405, "method_not_allowed", "Static assets are read-only.");
       return await serveStatic(publicDirectory, request, response, url.pathname);
     } catch (error) {
+      if (error instanceof UserEditError) return sendProblem(response, error.status, "user_edit_error", error.message);
+      if (error instanceof TurnNotFoundError) return sendProblem(response, 404, "turn_not_found", error.message);
       return sendProblem(response, 500, "internal_error", safeErrorMessage(error));
     }
   });
@@ -189,6 +193,55 @@ export function createLocalWebServer(options: LocalWebServerOptions): {
 
 async function handleApi(options: LocalWebServerOptions, request: IncomingMessage, response: ServerResponse, url: URL, pageSize: number, eventResponses: Set<ServerResponse>, organizationJobs: Map<string, OrganizationJob>): Promise<void> {
   const provider = options.provider;
+  const overrideMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/user-overrides\/(title|label|parent)$/);
+  const manualCandidatesMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/manual-parents$/);
+  const latestEditMatch = url.pathname.match(/^\/api\/scopes\/([^/]+)\/user-edits\/latest$/);
+  const undoMatch = url.pathname.match(/^\/api\/user-edits\/([^/]+)\/undo$/);
+  if (overrideMatch || manualCandidatesMatch || latestEditMatch || undoMatch) {
+    if (!["GET", "HEAD", "POST"].includes(request.method ?? "")) return sendProblem(response, 405, "method_not_allowed", "Unsupported manual edit method.");
+    if (request.method === "POST" && !sameOrigin(request)) return sendProblem(response, 403, "cross_origin_denied", "Manual edits require the local UI origin.");
+    const store = options.userOverrides;
+    if (!store) return sendProblem(response, 503, "user_store_unavailable", "User override storage is unavailable.");
+    if (latestEditMatch) {
+      if (request.method === "POST") return sendProblem(response, 405, "method_not_allowed", "History reads are read-only.");
+      return sendJson(response, 200, { edit: store.overrides.latest(decodePathPart(latestEditMatch[1])) });
+    }
+    if (undoMatch) {
+      if (request.method !== "POST") return sendProblem(response, 405, "method_not_allowed", "Undo requires POST.");
+      const body = await readJsonBody(request);
+      const edit = store.overrides.history(decodePathPart(undoMatch[1]));
+      if (!edit) throw new UserEditError("Manual change not found.", 404);
+      const session = await provider.readSession(edit.sessionId);
+      if (session.providerId !== edit.providerId) throw new UserEditError("Manual change provider mismatch.");
+      const sessions = await loadManualSessions(provider, session.workspaceScopeId);
+      return sendJson(response, 200, { edit: store.overrides.undo(edit.id, requireRevision(body.revision), session.workspaceScopeId, sessions) });
+    }
+    const session = await provider.readSession(decodePathPart((overrideMatch ?? manualCandidatesMatch)![1]));
+    if (manualCandidatesMatch) {
+      if (request.method === "POST") return sendProblem(response, 405, "method_not_allowed", "Candidate search is read-only.");
+      const sessions = await loadManualSessions(provider, session.workspaceScopeId);
+      return sendJson(response, 200, { candidates: store.overrides.manualCandidates(session, sessions, url.searchParams.get("q") ?? "") });
+    }
+    const field = overrideMatch![2] as UserField;
+    const nativeTurnId = field === "label" ? url.searchParams.get("turnId") ?? undefined : undefined;
+    if (field === "label" && !nativeTurnId) throw new UserEditError("A native Turn ID is required.");
+    const turn = nativeTurnId ? await findTurn(provider, session.providerSessionId, nativeTurnId) : undefined;
+    const key = { providerId: session.providerId, sessionId: session.providerSessionId, field, nativeTurnId };
+    let edit;
+    if (request.method === "POST") {
+      const body = await readJsonBody(request);
+      const value = parseUserValue(field, body.value);
+      const sessions = field === "parent" ? await loadManualSessions(provider, session.workspaceScopeId) : undefined;
+      edit = store.overrides.write(key, session.workspaceScopeId, value, requireRevision(body.revision), sessions);
+    }
+    const override = store.overrides.read(key) ?? { ...key, value: null, revision: 0 };
+    return sendJson(response, 200, {
+      override, edit,
+      semanticTitle: field === "title" ? projectSemanticTitle(session.title, await store.getSessionTitle(session.providerId, session.providerSessionId)) : undefined,
+      semanticTrace: turn ? await inspectSemanticTrace(turn, options.semanticTraces) : undefined,
+      semanticParent: field === "parent" ? projectSemanticParent({ lookup: { freshness: "missing", currentSourceFingerprint: "", edge: await store.getSemanticParent(session.providerId, session.providerSessionId) }, candidates: [], nativeLineage: null }) : undefined,
+    });
+  }
   if (request.method === "POST" && url.pathname === "/api/refresh") {
     if (!sameOrigin(request)) return sendProblem(response, 403, "cross_origin_denied", "Refresh is available only to the local UI origin.");
     if (!provider.refresh) return sendProblem(response, 501, "refresh_unavailable", "This provider does not support snapshot refresh.");
@@ -334,6 +387,7 @@ async function handleApi(options: LocalWebServerOptions, request: IncomingMessag
     return sendJson(response, 200, {
       capabilities,
       scopes,
+      userOverrides: { available: Boolean(options.userOverrides) },
       semanticTraces: {
         available: Boolean(options.semanticTraces),
         generationAvailable: Boolean(options.semanticTraces) && options.semanticGenerationAvailable !== false,
@@ -408,6 +462,14 @@ async function handleApi(options: LocalWebServerOptions, request: IncomingMessag
     return sendJson(response, 200, { forest });
   }
 
+  const turnMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/turns\/([^/]+)$/);
+  if (turnMatch) {
+    const turn = await findTurn(provider, decodePathPart(turnMatch[1]), decodePathPart(turnMatch[2]));
+    return sendJson(response, 200, {
+      turn: { ...projectTranscriptTurn(turn), semanticTrace: await inspectSemanticTrace(turn, options.semanticTraces) },
+    });
+  }
+
   const turnsMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/turns$/);
   if (turnsMatch) {
     const sessionId = decodePathPart(turnsMatch[1]);
@@ -438,7 +500,14 @@ async function handleApi(options: LocalWebServerOptions, request: IncomingMessag
   return sendProblem(response, 404, "not_found", "API route not found.");
 }
 
+class TurnNotFoundError extends Error {}
+
 async function findTurn(provider: LocalWebProvider, sessionId: string, turnId: string): Promise<Turn> {
+  if (provider.readTurn) {
+    const turn = await provider.readTurn(sessionId, turnId);
+    if (turn) return turn;
+    throw new TurnNotFoundError("Unknown session turn");
+  }
   let cursor: string | undefined;
   const seen = new Set<string>();
   do {
@@ -449,7 +518,7 @@ async function findTurn(provider: LocalWebProvider, sessionId: string, turnId: s
     seen.add(page.nextCursor);
     cursor = page.nextCursor;
   } while (cursor);
-  throw new Error("Unknown session turn");
+  throw new TurnNotFoundError("Unknown session turn");
 }
 
 async function loadAllTurns(provider: LocalWebProvider, sessionId: string): Promise<readonly Turn[]> {
@@ -530,8 +599,8 @@ function projectSemanticTitle(originalTitle: string, title?: LocalWebSemanticTit
     generatedTitle: title?.generatedTitle,
     userTitle: title?.userTitle,
     displayTitle: title?.userTitle ?? title?.generatedTitle ?? originalTitle,
-    model: title?.generator.model,
-    promptVersion: title?.generator.version,
+    model: title?.generator?.model,
+    promptVersion: title?.generator?.version,
     generatedAt: title?.generatedAt,
     userEditedAt: title?.userEditedAt,
   };
@@ -554,8 +623,8 @@ function projectSemanticParent(result: LocalWebSemanticParentResult) {
     userRelation: edge?.userRelation,
     userParentSessionId: edge?.userParentSessionId,
     userReviewedAt: edge?.userReviewedAt,
-    model: edge?.generator.model,
-    promptVersion: edge?.generator.version,
+    model: edge?.generator?.model,
+    promptVersion: edge?.generator?.version,
     candidates: result.candidates.map((candidate) => ({
       sessionId: candidate.projection.sessionId,
       title: candidate.projection.semanticTitle ?? candidate.projection.originalTitle,
@@ -571,9 +640,41 @@ function projectSemanticParent(result: LocalWebSemanticParentResult) {
 async function inspectSemanticTrace(turn: Turn, semanticTraces: LocalWebSemanticTraces | undefined) {
   if (!semanticTraces) return { availability: "unavailable" as const };
   const lookup = await semanticTraces.inspect(turn);
-  if (!lookup.trace) return { availability: "available" as const, freshness: lookup.freshness };
   const feedback = await semanticTraces.getUserFeedback?.(turn);
-  return projectSemanticTrace(lookup.freshness, lookup.trace, semanticTraces.inspectSafety?.(turn, lookup.trace), feedback, lookup.currentInputFingerprint);
+  const label = feedback?.editedText ?? lookup.trace?.text ?? (turn.input?.text?.replace(/\s+/g, " ").trim().slice(0, 120) || `第 ${turn.displayOrdinal} 轮`);
+  if (!lookup.trace) return { availability: "available" as const, freshness: lookup.freshness, displayText: feedback?.editedText, navigationLabel: label, userLabel: feedback?.editedText, userFeedback: feedback };
+  return { ...projectSemanticTrace(lookup.freshness, lookup.trace, semanticTraces.inspectSafety?.(turn, lookup.trace), feedback, lookup.currentInputFingerprint), navigationLabel: label, userLabel: feedback?.editedText };
+}
+
+function requireRevision(value: unknown): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw new UserEditError("A non-negative integer revision is required.");
+  return value;
+}
+
+function parseUserValue(field: UserField, input: unknown): UserValue | null {
+  if (input === null) return null;
+  if (!input || typeof input !== "object") throw new UserEditError("An override value or null is required.");
+  const value = input as Record<string, unknown>;
+  try {
+    if (field === "title") return { title: normalizeSemanticSessionTitle(typeof value.title === "string" ? value.title : "") };
+    if (field === "label") return { label: normalizeTraceText(typeof value.label === "string" ? value.label : "") };
+    if (value.parentSessionId !== undefined && value.parentSessionId !== null && typeof value.parentSessionId !== "string") throw new Error("Parent Session ID must be a string.");
+    return { relation: parseSemanticParentRelation(value.relation), parentSessionId: typeof value.parentSessionId === "string" ? value.parentSessionId : undefined };
+  } catch (error) { throw new UserEditError((error as Error).message); }
+}
+
+async function loadManualSessions(provider: LocalWebProvider, workspace: string): Promise<Session[]> {
+  const sessions: Session[] = [];
+  let cursor: string | undefined;
+  const seen = new Set<string>();
+  do {
+    const page = await provider.listSessions(workspace, cursor);
+    sessions.push(...page.data);
+    if (!page.nextCursor || seen.has(page.nextCursor)) break;
+    seen.add(page.nextCursor);
+    cursor = page.nextCursor;
+  } while (cursor);
+  return sessions;
 }
 
 function projectSemanticTrace(
@@ -598,7 +699,7 @@ function projectSemanticTrace(
       verdict: feedback.verdict,
       editedText: feedback.editedText,
       reviewedAt: feedback.reviewedAt,
-      basedOnStaleSource: feedback.verdict === "edited" && feedback.sourceFingerprint !== currentInputFingerprint,
+      basedOnStaleSource: feedback.verdict === "edited" && Boolean(feedback.sourceFingerprint) && feedback.sourceFingerprint !== currentInputFingerprint,
     } : undefined,
   };
 }

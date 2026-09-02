@@ -127,9 +127,8 @@ export class StructuredCodexSource {
         completedAt: number(row.completed_at),
         items: itemsByTurn.get(String(row.turn_id)) ?? [],
       }));
-      return projectAppServerTurns(sessionId, appServerShape).map((turn, index) => ({
+      return projectAppServerTurns(sessionId, appServerShape).map((turn) => ({
         ...turn,
-        ordinal: number(turnRows[index]?.rollout_ordinal) ?? index + 1,
         sourceTier: "structured_fallback" as const,
       }));
     } finally {

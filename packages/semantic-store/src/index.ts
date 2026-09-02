@@ -9,6 +9,8 @@ import type {
   SessionProvider,
 } from "../../core/src/index.ts";
 import type { SemanticParentEdge, SemanticParentRelation, SemanticParentStore } from "./semantic-parent.ts";
+import { UserOverrides, migrateUserOverrides } from "./user-overrides.ts";
+export * from "./user-overrides.ts";
 
 export * from "./prompt-generator.ts";
 export * from "./session-title-generator.ts";
@@ -16,7 +18,7 @@ export * from "./ollama-client.ts";
 export * from "./semantic-safety.ts";
 export * from "./semantic-parent.ts";
 
-export const SEMANTIC_STORE_SCHEMA_VERSION = 4;
+export const SEMANTIC_STORE_SCHEMA_VERSION = 5;
 
 export type SemanticTraceUserVerdict = "accepted" | "edited" | "rejected";
 
@@ -51,6 +53,8 @@ export interface SemanticSessionTitleSource {
   readonly firstUserInput?: string;
   readonly semanticTraces: readonly SemanticSessionTitleTraceInput[];
   readonly fallbackTurns: readonly SemanticSessionTitleFallbackTurn[];
+  /** Full public source fingerprint, independent of the sampled title prompt. */
+  readonly sourceContentFingerprint?: string;
 }
 
 export interface GeneratedSemanticSessionTitle {
@@ -65,11 +69,11 @@ export interface SemanticSessionTitleGenerator {
 export interface SemanticSessionTitle {
   readonly providerId: string;
   readonly sessionId: string;
-  readonly generatedTitle: string;
+  readonly generatedTitle?: string;
   readonly userTitle?: string;
-  readonly generator: SemanticGeneratorIdentity;
-  readonly sourceFingerprint: string;
-  readonly generatedAt: string;
+  readonly generator?: SemanticGeneratorIdentity;
+  readonly sourceFingerprint?: string;
+  readonly generatedAt?: string;
   readonly userEditedAt?: string;
 }
 
@@ -107,11 +111,14 @@ export interface SemanticTraceStore extends DerivedStoreLifecycle, SemanticParen
 export class SqliteSemanticTraceStore implements SemanticTraceStore {
   readonly schemaVersion = SEMANTIC_STORE_SCHEMA_VERSION;
   readonly #database: DatabaseSync;
+  readonly overrides: UserOverrides;
 
   constructor(databasePath = ":memory:") {
     this.#database = new DatabaseSync(databasePath);
     this.#database.exec("PRAGMA foreign_keys = ON");
-    this.#migrate();
+    try { this.#migrate(); }
+    catch (error) { this.#database.close(); throw error; }
+    this.overrides = new UserOverrides(this.#database);
   }
 
   async get(identity: TurnIdentity): Promise<TurnSemanticTrace | undefined> {
@@ -162,6 +169,13 @@ export class SqliteSemanticTraceStore implements SemanticTraceStore {
   }
 
   async getUserFeedback(identity: TurnIdentity): Promise<SemanticTraceUserFeedback | undefined> {
+    const key = { providerId: identity.providerId, sessionId: identity.sessionId, nativeTurnId: identity.nativeTurnId };
+    const override = this.overrides.read({ ...key, field: "label" });
+    if (override) {
+      const feedback = override.value?.feedback;
+      if (feedback) return { ...key, ...feedback, editedText: override.value?.label ?? feedback.editedText };
+      return override.value?.label ? { ...key, verdict: "edited", editedText: override.value.label, aiOriginalText: "", sourceFingerprint: "", reviewedAt: override.updatedAt } : undefined;
+    }
     const row = this.#database.prepare(`
       SELECT provider_id, session_id, native_turn_id, verdict, ai_original_text,
              edited_text, source_fingerprint, reviewed_at
@@ -175,27 +189,11 @@ export class SqliteSemanticTraceStore implements SemanticTraceStore {
     const editedText = feedback.verdict === "edited"
       ? normalizeTraceText(feedback.editedText ?? "")
       : undefined;
-    this.#database.prepare(`
-      INSERT INTO turn_semantic_trace_feedback (
-        provider_id, session_id, native_turn_id, verdict, ai_original_text,
-        edited_text, source_fingerprint, reviewed_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(provider_id, session_id, native_turn_id) DO UPDATE SET
-        verdict = excluded.verdict,
-        ai_original_text = excluded.ai_original_text,
-        edited_text = excluded.edited_text,
-        source_fingerprint = excluded.source_fingerprint,
-        reviewed_at = excluded.reviewed_at
-    `).run(
-      feedback.providerId,
-      feedback.sessionId,
-      feedback.nativeTurnId,
-      feedback.verdict,
-      normalizeTraceText(feedback.aiOriginalText),
-      editedText ?? null,
-      feedback.sourceFingerprint,
-      feedback.reviewedAt,
-    );
+    this.overrides.write({ providerId: feedback.providerId, sessionId: feedback.sessionId, nativeTurnId: feedback.nativeTurnId, field: "label" }, "", {
+      label: editedText,
+      feedback: { verdict: feedback.verdict, aiOriginalText: normalizeTraceText(feedback.aiOriginalText), editedText, sourceFingerprint: feedback.sourceFingerprint, reviewedAt: feedback.reviewedAt },
+    });
+
   }
 
   async getSessionTitle(providerId: string, sessionId: string): Promise<SemanticSessionTitle | undefined> {
@@ -205,7 +203,9 @@ export class SqliteSemanticTraceStore implements SemanticTraceStore {
       FROM session_semantic_titles
       WHERE provider_id = ? AND session_id = ?
     `).get(providerId, sessionId) as SessionTitleRow | undefined;
-    return row ? projectSessionTitleRow(row) : undefined;
+    const override = this.overrides.read({ providerId, sessionId, field: "title" });
+    if (!row && !override?.value?.title) return undefined;
+    return { ...(row ? projectSessionTitleRow(row) : { providerId, sessionId }), userTitle: override?.value?.title, userEditedAt: override?.value ? override.updatedAt : undefined };
   }
 
   async putGeneratedSessionTitle(title: SemanticSessionTitle): Promise<void> {
@@ -224,22 +224,17 @@ export class SqliteSemanticTraceStore implements SemanticTraceStore {
     `).run(
       title.providerId,
       title.sessionId,
-      normalizeSemanticSessionTitle(title.generatedTitle),
-      title.generator.id,
-      title.generator.version,
-      title.generator.model ?? null,
+      normalizeSemanticSessionTitle(title.generatedTitle ?? ""),
+      title.generator!.id,
+      title.generator!.version,
+      title.generator!.model ?? null,
       title.sourceFingerprint,
       title.generatedAt,
     );
   }
 
   async putUserSessionTitle(providerId: string, sessionId: string, userTitle: string, userEditedAt: string): Promise<void> {
-    const result = this.#database.prepare(`
-      UPDATE session_semantic_titles
-      SET user_title = ?, user_edited_at = ?
-      WHERE provider_id = ? AND session_id = ?
-    `).run(normalizeSemanticSessionTitle(userTitle), userEditedAt, providerId, sessionId);
-    if (result.changes === 0) throw new Error("Generate a Semantic Session Title before editing it.");
+    this.overrides.write({ providerId, sessionId, field: "title" }, "", { title: normalizeSemanticSessionTitle(userTitle) });
   }
 
   async getSemanticParent(providerId: string, childSessionId: string): Promise<SemanticParentEdge | undefined> {
@@ -250,7 +245,9 @@ export class SqliteSemanticTraceStore implements SemanticTraceStore {
       FROM session_semantic_edges
       WHERE provider_id = ? AND child_session_id = ?
     `).get(providerId, childSessionId) as SemanticParentRow | undefined;
-    return row ? projectSemanticParentRow(row) : undefined;
+    const override = this.overrides.read({ providerId, sessionId: childSessionId, field: "parent" });
+    if (!row && !override?.value?.relation) return undefined;
+    return { ...(row ? projectSemanticParentRow(row) : { providerId, childSessionId }), userRelation: override?.value?.relation, userParentSessionId: override?.value?.parentSessionId, userReviewedAt: override?.value ? override.updatedAt : undefined };
   }
 
   async listSemanticParents(providerId: string): Promise<readonly SemanticParentEdge[]> {
@@ -262,7 +259,8 @@ export class SqliteSemanticTraceStore implements SemanticTraceStore {
       WHERE provider_id = ?
       ORDER BY generated_at, child_session_id
     `).all(providerId) as unknown as SemanticParentRow[];
-    return rows.map(projectSemanticParentRow);
+    const ids = new Set([...rows.map((row) => row.child_session_id), ...this.overrides.list(providerId, "parent").map((row) => row.sessionId)]);
+    return (await Promise.all([...ids].map((id) => this.getSemanticParent(providerId, id)))).filter((edge) => edge !== undefined);
   }
 
   async putGeneratedSemanticParent(edge: SemanticParentEdge): Promise<void> {
@@ -287,9 +285,9 @@ export class SqliteSemanticTraceStore implements SemanticTraceStore {
       edge.generatedParentSessionId ?? null,
       edge.generatedRelation,
       edge.generatedReason,
-      edge.generator.id,
-      edge.generator.version,
-      edge.generator.model ?? null,
+      edge.generator!.id,
+      edge.generator!.version,
+      edge.generator!.model ?? null,
       edge.sourceFingerprint,
       edge.generatedAt,
     );
@@ -302,12 +300,7 @@ export class SqliteSemanticTraceStore implements SemanticTraceStore {
     relation: SemanticParentRelation,
     reviewedAt: string,
   ): Promise<void> {
-    const result = this.#database.prepare(`
-      UPDATE session_semantic_edges
-      SET user_parent_session_id = ?, user_relation = ?, user_reviewed_at = ?
-      WHERE provider_id = ? AND child_session_id = ?
-    `).run(parentSessionId ?? null, relation, reviewedAt, providerId, childSessionId);
-    if (result.changes === 0) throw new Error("Infer a Semantic Parent before reviewing it.");
+    this.overrides.write({ providerId, sessionId: childSessionId, field: "parent" }, "", { relation, parentSessionId });
   }
 
   async close(): Promise<void> {
@@ -317,8 +310,9 @@ export class SqliteSemanticTraceStore implements SemanticTraceStore {
   #migrate(): void {
     const version = Number(this.#database.prepare("PRAGMA user_version").get()?.user_version ?? 0);
     if (version > SEMANTIC_STORE_SCHEMA_VERSION) throw new Error(`Unsupported semantic store schema version: ${version}`);
+    this.#database.exec("BEGIN IMMEDIATE");
+    try {
     if (version < 1) this.#database.exec(`
-      BEGIN IMMEDIATE;
       CREATE TABLE IF NOT EXISTS turn_semantic_traces (
         provider_id TEXT NOT NULL,
         session_id TEXT NOT NULL,
@@ -334,10 +328,8 @@ export class SqliteSemanticTraceStore implements SemanticTraceStore {
       CREATE INDEX IF NOT EXISTS turn_semantic_traces_session
         ON turn_semantic_traces(provider_id, session_id);
       PRAGMA user_version = 1;
-      COMMIT;
     `);
     if (version < 2) this.#database.exec(`
-      BEGIN IMMEDIATE;
       CREATE TABLE IF NOT EXISTS turn_semantic_trace_feedback (
         provider_id TEXT NOT NULL,
         session_id TEXT NOT NULL,
@@ -352,10 +344,8 @@ export class SqliteSemanticTraceStore implements SemanticTraceStore {
       CREATE INDEX IF NOT EXISTS turn_semantic_trace_feedback_session
         ON turn_semantic_trace_feedback(provider_id, session_id);
       PRAGMA user_version = 2;
-      COMMIT;
     `);
     if (version < 3) this.#database.exec(`
-      BEGIN IMMEDIATE;
       CREATE TABLE IF NOT EXISTS session_semantic_titles (
         provider_id TEXT NOT NULL,
         session_id TEXT NOT NULL,
@@ -370,10 +360,8 @@ export class SqliteSemanticTraceStore implements SemanticTraceStore {
         PRIMARY KEY (provider_id, session_id)
       );
       PRAGMA user_version = 3;
-      COMMIT;
     `);
     if (version < 4) this.#database.exec(`
-      BEGIN IMMEDIATE;
       CREATE TABLE IF NOT EXISTS session_semantic_edges (
         provider_id TEXT NOT NULL,
         child_session_id TEXT NOT NULL,
@@ -398,8 +386,10 @@ export class SqliteSemanticTraceStore implements SemanticTraceStore {
       CREATE INDEX IF NOT EXISTS session_semantic_edges_parent
         ON session_semantic_edges(provider_id, generated_parent_session_id);
       PRAGMA user_version = 4;
-      COMMIT;
     `);
+    if (version < 5) { migrateUserOverrides(this.#database); this.#database.exec("PRAGMA user_version = 5"); }
+    this.#database.exec("COMMIT");
+    } catch (error) { this.#database.exec("ROLLBACK"); throw error; }
   }
 }
 
@@ -422,9 +412,9 @@ export class SemanticSessionTitleService {
   async inspect(source: SemanticSessionTitleSource): Promise<SemanticSessionTitleLookup> {
     const currentSourceFingerprint = semanticSessionTitleSourceFingerprint(source);
     const title = await this.#store.getSessionTitle(source.providerId, source.sessionId);
-    if (!title) return { freshness: "missing", currentSourceFingerprint };
+    if (!title?.generatedTitle) return { freshness: "missing", title, currentSourceFingerprint };
     return {
-      freshness: title.sourceFingerprint === currentSourceFingerprint && sameGenerator(title.generator, this.#generator.identity) ? "current" : "stale",
+      freshness: title.sourceFingerprint === currentSourceFingerprint && title.generator && sameGenerator(title.generator, this.#generator.identity) ? "current" : "stale",
       title,
       currentSourceFingerprint,
     };
@@ -461,7 +451,7 @@ export class SemanticSessionTitleService {
       userEditedAt: previous?.userEditedAt,
     };
     await this.#store.putGeneratedSessionTitle(title);
-    return title;
+    return (await this.#store.getSessionTitle(source.providerId, source.sessionId))!;
   }
 }
 
@@ -561,6 +551,7 @@ export class SessionSemanticTraceIndexer {
 /** Hashes only public provider-neutral semantic inputs; provenance and ordinals do not invalidate a trace. */
 export function semanticInputFingerprint(turn: Turn): string {
   const value = {
+    contentVersion: 2,
     initiatorKind: turn.initiatorKind,
     status: turn.status,
     input: turn.input,
@@ -577,8 +568,18 @@ export function semanticInputFingerprint(turn: Turn): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
+/** Tracks all public Turns, including changes outside a generator's sampling window. */
+export function semanticSessionContentFingerprint(turns: readonly Turn[]): string {
+  return createHash("sha256").update(JSON.stringify(turns.map((turn) => ({
+    nativeTurnId: turn.nativeTurnId,
+    content: semanticInputFingerprint(turn),
+  })))).digest("hex");
+}
+
 export function semanticSessionTitleSourceFingerprint(source: SemanticSessionTitleSource): string {
   return createHash("sha256").update(JSON.stringify({
+    contentVersion: 2,
+    sourceContentFingerprint: source.sourceContentFingerprint,
     originalTitle: source.originalTitle,
     firstUserInput: source.firstUserInput,
     semanticTraces: source.semanticTraces,

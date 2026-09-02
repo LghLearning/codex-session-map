@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
-import type { Session } from "../../core/src/index.ts";
+import type { Session, Turn } from "../../core/src/index.ts";
 import {
   PromptSemanticParentGenerator,
   SemanticParentService,
@@ -10,6 +11,7 @@ import {
   parseSemanticParentOutput,
   preferredSemanticParent,
   selectSemanticParentCandidates,
+  semanticSessionContentFingerprint,
   type GeneratedSemanticParent,
   type SemanticParentGenerator,
   type SemanticParentInferenceSource,
@@ -21,6 +23,39 @@ const sessions = [
   session("child", "2026-08-03T00:00:00.000Z", "继续实现 Semantic Trace UI"),
   session("future", "2026-08-04T00:00:00.000Z", "Semantic Trace 后续"),
 ];
+
+test("parent freshness follows full current and candidate content without changing inference inputs", async () => {
+  const turn: Turn = {
+    providerId: "fixture", sessionId: "child", nativeTurnId: "native-1", displayOrdinal: 1,
+    initiatorKind: "user", status: "completed", input: { text: "检查", attachments: [] },
+    assistantFinal: `${"背景内容。".repeat(200)}\n结论 A`, tools: [], partial: false,
+    health: { state: "complete", issues: [] }, provenance: [],
+  };
+  const before = semanticSessionContentFingerprint([turn]);
+  const after = semanticSessionContentFingerprint([{ ...turn, assistantFinal: `${"背景内容。".repeat(200)}\n结论 B` }]);
+  const legacySource = sourceFor("child", "parent");
+  const source = {
+    current: { ...legacySource.current, sourceContentFingerprint: before },
+    candidates: legacySource.candidates.map((candidate) => ({ ...candidate, projection: { ...candidate.projection, sourceContentFingerprint: before } })),
+  };
+  const store = new SqliteSemanticTraceStore();
+  const generator = new QueueGenerator([{ relation: "continuation", parentSessionId: "parent", reason: "已有关系" }]);
+  const service = new SemanticParentService({ store, generator });
+  const saved = await service.generate(source, sessions);
+  for (const changed of [
+    { ...source, current: { ...source.current, sourceContentFingerprint: after } },
+    { ...source, candidates: source.candidates.map((candidate) => ({ ...candidate, projection: { ...candidate.projection, sourceContentFingerprint: after } })) },
+  ]) {
+    assert.equal(buildSemanticParentRequest(source).input, buildSemanticParentRequest(changed).input);
+    assert.equal((await service.inspect(changed)).freshness, "stale");
+  }
+  assert.equal((await service.inspect(source)).freshness, "current");
+  const oldHash = createHash("sha256").update(JSON.stringify({ current: legacySource.current, candidates: legacySource.candidates.map((candidate) => candidate.projection) })).digest("hex");
+  await store.putGeneratedSemanticParent({ ...saved, sourceFingerprint: oldHash });
+  assert.equal((await service.inspect(legacySource)).freshness, "stale");
+  assert.equal((await store.getSemanticParent("fixture", "child"))?.generatedParentSessionId, "parent");
+  await store.close();
+});
 
 test("candidate selection is same-workspace, past-only, bounded, and keeps the true textual parent", () => {
   const projections = sessions.map((value) => buildSemanticSessionProjection({

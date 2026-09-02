@@ -12,6 +12,8 @@ export interface SemanticSessionProjection {
   readonly originalTitle: string;
   readonly semanticTitle?: string;
   readonly representativeTraces: readonly string[];
+  /** Full public source fingerprint; not part of candidate ranking or the model prompt. */
+  readonly sourceContentFingerprint?: string;
 }
 
 export interface SemanticParentCandidate {
@@ -40,11 +42,11 @@ export interface SemanticParentEdge {
   readonly providerId: string;
   readonly childSessionId: string;
   readonly generatedParentSessionId?: string;
-  readonly generatedRelation: SemanticParentRelation;
-  readonly generatedReason: string;
-  readonly generator: SemanticGeneratorIdentity;
-  readonly sourceFingerprint: string;
-  readonly generatedAt: string;
+  readonly generatedRelation?: SemanticParentRelation;
+  readonly generatedReason?: string;
+  readonly generator?: SemanticGeneratorIdentity;
+  readonly sourceFingerprint?: string;
+  readonly generatedAt?: string;
   readonly userParentSessionId?: string;
   readonly userRelation?: SemanticParentRelation;
   readonly userReviewedAt?: string;
@@ -71,8 +73,8 @@ export interface SemanticParentStore {
 
 export interface SemanticParentDisplay {
   readonly parentSessionId?: string;
-  readonly relation: SemanticParentRelation;
-  readonly authority: "ai" | "user";
+  readonly relation?: SemanticParentRelation;
+  readonly authority: "ai" | "user" | "none";
 }
 
 const MAX_CANDIDATES = 8;
@@ -126,10 +128,10 @@ export class SemanticParentService {
   async inspect(source: SemanticParentInferenceSource): Promise<SemanticParentLookup> {
     const currentSourceFingerprint = semanticParentSourceFingerprint(source);
     const edge = await this.#store.getSemanticParent(source.current.providerId, source.current.sessionId);
-    if (!edge) return { freshness: "missing", currentSourceFingerprint };
-    const sameGenerator = edge.generator.id === this.#generator.identity.id
-      && edge.generator.version === this.#generator.identity.version
-      && edge.generator.model === this.#generator.identity.model;
+    if (!edge?.generatedRelation) return { freshness: "missing", edge, currentSourceFingerprint };
+    const sameGenerator = edge.generator?.id === this.#generator.identity.id
+      && edge.generator?.version === this.#generator.identity.version
+      && edge.generator?.model === this.#generator.identity.model;
     return {
       freshness: sameGenerator && edge.sourceFingerprint === currentSourceFingerprint ? "current" : "stale",
       edge,
@@ -154,8 +156,6 @@ export class SemanticParentService {
     relation: SemanticParentRelation;
     sessions: readonly Session[];
   }): Promise<SemanticParentEdge> {
-    const stored = await this.#store.getSemanticParent(options.providerId, options.childSessionId);
-    if (!stored) throw new Error("Infer a Semantic Parent before reviewing it.");
     validateSemanticEdge(options.childSessionId, options.parentSessionId, options.relation, options.sessions);
     await this.#assertAcyclic(options.providerId, options.childSessionId, options.parentSessionId, options.relation);
     await this.#store.putUserSemanticParent(
@@ -191,7 +191,7 @@ export class SemanticParentService {
       userReviewedAt: previous?.userReviewedAt,
     };
     await this.#store.putGeneratedSemanticParent(edge);
-    return edge;
+    return (await this.#store.getSemanticParent(source.current.providerId, source.current.sessionId))!;
   }
 
   async #assertAcyclic(providerId: string, childSessionId: string, parentSessionId: string | undefined, relation: SemanticParentRelation): Promise<void> {
@@ -252,6 +252,7 @@ export function buildSemanticSessionProjection(options: {
   session: Session;
   semanticTitle?: string;
   traceTexts: readonly string[];
+  sourceContentFingerprint?: string;
 }): SemanticSessionProjection {
   return {
     providerId: options.session.providerId,
@@ -261,6 +262,7 @@ export function buildSemanticSessionProjection(options: {
     originalTitle: options.session.title,
     semanticTitle: options.semanticTitle,
     representativeTraces: sampleRepresentative(options.traceTexts, MAX_REPRESENTATIVE_TRACES),
+    ...(options.sourceContentFingerprint ? { sourceContentFingerprint: options.sourceContentFingerprint } : {}),
   };
 }
 
@@ -313,6 +315,7 @@ export function parseSemanticParentOutput(output: string, candidateIds: readonly
 
 export function semanticParentSourceFingerprint(source: SemanticParentInferenceSource): string {
   return createHash("sha256").update(JSON.stringify({
+    contentVersion: 2,
     current: source.current,
     candidates: source.candidates.map((candidate) => candidate.projection),
   })).digest("hex");
@@ -320,7 +323,7 @@ export function semanticParentSourceFingerprint(source: SemanticParentInferenceS
 
 export function preferredSemanticParent(edge: SemanticParentEdge): SemanticParentDisplay {
   if (edge.userRelation) return { parentSessionId: edge.userParentSessionId, relation: edge.userRelation, authority: "user" };
-  return { parentSessionId: edge.generatedParentSessionId, relation: edge.generatedRelation, authority: "ai" };
+  return { parentSessionId: edge.generatedParentSessionId, relation: edge.generatedRelation, authority: edge.generatedRelation ? "ai" : "none" };
 }
 
 export function validateSemanticEdge(

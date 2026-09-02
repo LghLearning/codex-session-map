@@ -7,12 +7,32 @@ import type { Session, Turn, TurnSemanticTrace } from "../../core/src/index.ts";
 import {
   assembleSemanticSessionTitleSource,
   buildSemanticSessionTitleRequest,
+  semanticSessionContentFingerprint,
   preferredSessionDisplayTitle,
   SemanticSessionTitleService,
   SqliteSemanticTraceStore,
   type SemanticSessionTitleGenerator,
   type SemanticTraceUserFeedback,
 } from "../src/index.ts";
+
+test("titles become stale on full-source tail changes even when existing Trace text is unchanged", async () => {
+  const turns = [turn(1), turn(2), { ...turn(3), assistantFinal: `${"背景内容。".repeat(200)}\n结论 A` }];
+  const traces = turns.map((value) => trace(value, "已有摘要不变。"));
+  const before = assembleSemanticSessionTitleSource({ session: session(), turns, traces, feedback: [] });
+  const changed = [...turns.slice(0, 2), { ...turns[2], assistantFinal: `${"背景内容。".repeat(200)}\n结论 B` }];
+  const after = assembleSemanticSessionTitleSource({ session: session(), turns: changed, traces, feedback: [] });
+  assert.equal(buildSemanticSessionTitleRequest(before).input, buildSemanticSessionTitleRequest(after).input, "three existing traces hide the raw change from the sampled prompt");
+  assert.notEqual(before.sourceContentFingerprint, after.sourceContentFingerprint);
+  assert.equal(semanticSessionContentFingerprint(turns), semanticSessionContentFingerprint(turns.map((value) => ({ ...value, displayOrdinal: value.displayOrdinal + 100 }))));
+  const store = new SqliteSemanticTraceStore();
+  const service = new SemanticSessionTitleService({ store, generator: generator(["原有标题"]) });
+  await service.generate(before);
+  const saved = await service.edit(before.providerId, before.sessionId, "用户已有标题");
+  assert.equal((await service.inspect(before)).freshness, "current");
+  assert.equal((await service.inspect(after)).freshness, "stale");
+  assert.deepEqual(await service.readStored(before.providerId, before.sessionId), saved, "stale inspection never rewrites user or AI records");
+  await store.close();
+});
 
 test("title source follows native Turn order and respects edited/rejected Trace feedback", () => {
   const turns = [turn(1), turn(2), turn(3)];

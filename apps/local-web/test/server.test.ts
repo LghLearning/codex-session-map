@@ -32,6 +32,51 @@ const turn: Turn = {
   provenance: [{ providerId: "fixture", tier: "primary", recordKey: "raw-key", completeness: "complete" }],
 };
 
+test("single-Turn API uses native IDs and full bodies without paging a capable provider", async (t) => {
+  const provider: LocalWebProvider = new FakeProvider();
+  const body = `# 原文\n\n${"背景内容。".repeat(200)}\n最终结论\n`;
+  const fullTurn = { ...turn, nativeTurnId: "native/一%", input: { ...turn.input, text: body }, assistantFinal: body };
+  const reads: string[][] = [];
+  provider.listTurns = async () => { throw new Error("listTurns must not be used for exact reads"); };
+  provider.readTurn = async (sessionId, nativeTurnId) => {
+    reads.push([sessionId, nativeTurnId]);
+    return sessionId === fullTurn.sessionId && nativeTurnId === fullTurn.nativeTurnId ? fullTurn : undefined;
+  };
+  const running = await createLocalWebServer({ provider, port: 0 }).start();
+  t.after(() => running.close());
+  const path = `/api/sessions/visible-a/turns/${encodeURIComponent(fullTurn.nativeTurnId)}`;
+  const response = await fetch(`${running.url}${path}`);
+  assert.equal(response.status, 200);
+  const payload = await response.json() as { turn: { id: string; ordinal: number; input: string; assistantFinal: string } };
+  assert.equal(payload.turn.id, fullTurn.nativeTurnId);
+  assert.equal(payload.turn.ordinal, 1);
+  assert.equal(payload.turn.input, body);
+  assert.equal(payload.turn.assistantFinal, body);
+  assert.deepEqual(reads, [["visible-a", fullTurn.nativeTurnId]]);
+  assert.equal((await fetch(`${running.url}/api/sessions/visible-b/turns/${encodeURIComponent(fullTurn.nativeTurnId)}`)).status, 404);
+  assert.equal((await fetch(`${running.url}/api/sessions/visible-a/turns/1`)).status, 404);
+  assert.equal((await fetch(`${running.url}${path}`, { method: "POST" })).status, 405);
+  provider.readTurn = async () => { throw new Error("source unavailable"); };
+  assert.equal((await fetch(`${running.url}${path}`)).status, 500, "source errors must not be hidden as missing Turns");
+});
+
+test("single-Turn API retains paginated lookup for providers without readTurn", async (t) => {
+  const provider: LocalWebProvider = new FakeProvider();
+  const target = { ...turn, nativeTurnId: "last-native", displayOrdinal: 2 };
+  const cursors: (string | undefined)[] = [];
+  provider.listTurns = async (_sessionId, cursor) => {
+    cursors.push(cursor);
+    return cursor ? { data: [target] } : { data: [turn], nextCursor: "opaque-next" };
+  };
+  const running = await createLocalWebServer({ provider, port: 0 }).start();
+  t.after(() => running.close());
+  const response = await fetch(`${running.url}/api/sessions/visible-a/turns/last-native`);
+  assert.equal(response.status, 200);
+  assert.equal(((await response.json()) as { turn: { id: string } }).turn.id, target.nativeTurnId);
+  assert.deepEqual(cursors, [undefined, "opaque-next"]);
+  assert.equal((await fetch(`${running.url}/api/sessions/visible-a/turns/missing`)).status, 404);
+});
+
 test("local web API is loopback-only, paginated, read-only, and provider-neutral", async (t) => {
   const provider = new FakeProvider();
   const semanticTraces = new FakeSemanticTraces();

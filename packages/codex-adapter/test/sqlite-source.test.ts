@@ -22,19 +22,27 @@ test("structured fallback recovers a session and native turn without rollouts", 
   history.exec("CREATE TABLE thread_items (thread_id TEXT, turn_id TEXT, item_id TEXT, rollout_ordinal INTEGER, item_json TEXT)");
   history.prepare("INSERT INTO thread_turns VALUES (?, ?, ?, ?, ?, ?, ?)").run("sqlite-session", "native-sqlite-turn", 7, "failed", "{\"message\":\"synthetic\"}", 1_700_000_001, 1_700_000_002);
   history.prepare("INSERT INTO thread_items VALUES (?, ?, ?, ?, ?)").run("sqlite-session", "native-sqlite-turn", "item-1", 8, JSON.stringify({ type: "userMessage", content: [{ type: "inputText", text: "Synthetic" }] }));
+  const fullBody = `# 完整正文\n\n${"背景内容。".repeat(200)}\n最终结论\n`;
+  history.prepare("INSERT INTO thread_turns VALUES (?, ?, ?, ?, ?, ?, ?)").run("sqlite-session", "native-second", 302, "completed", null, 1_700_000_003, 1_700_000_004);
+  history.prepare("INSERT INTO thread_items VALUES (?, ?, ?, ?, ?)").run("sqlite-session", "native-second", "item-2", 303, JSON.stringify({ type: "agentMessage", text: fullBody }));
   history.close();
 
   const statePath = join(home, "state_5.sqlite");
   const historyPath = join(home, "thread_history_1.sqlite");
   const before = [await digest(statePath), await digest(historyPath)];
 
-  const adapter = new CodexAdapterV1({ codexHome: home, disableAppServer: true });
+  const adapter = new CodexAdapterV1({ codexHome: home, disableAppServer: true, pageSize: 1 });
   const scopes = await adapter.listWorkspaceScopes();
   const sessionPage = await adapter.listSessions(scopes[0]!.id);
   assert.equal(sessionPage.data[0]?.providerSessionId, "sqlite-session");
   const turns = await adapter.listTurns("sqlite-session");
   assert.equal(turns.data[0]?.nativeTurnId, "native-sqlite-turn");
-  assert.equal(turns.data[0]?.displayOrdinal, 7);
+  assert.equal(turns.data[0]?.displayOrdinal, 1);
+  const nextPage = await adapter.listTurns("sqlite-session", turns.nextCursor);
+  assert.equal(nextPage.data[0]?.displayOrdinal, 2);
+  assert.equal(nextPage.data[0]?.assistantFinal, fullBody);
+  assert.deepEqual(await adapter.readTurn("sqlite-session", "native-second"), nextPage.data[0]);
+  assert.equal(await adapter.readTurn("sqlite-session", "302"), undefined);
   assert.equal(turns.data[0]?.status, "failed");
   assert.equal(adapter.getDiagnostics().some((item) => item.code === "missing_rollout"), true);
   assert.deepEqual([await digest(statePath), await digest(historyPath)], before, "read-only queries must not mutate either upstream database");

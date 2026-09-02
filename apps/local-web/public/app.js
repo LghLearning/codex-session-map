@@ -38,6 +38,9 @@ const state = {
   routeIssue: undefined,
   batchGeneration: undefined,
   batchSummary: undefined,
+  userOverrides: undefined,
+  lastManualEdit: undefined,
+  undoBusy: false,
 };
 
 const elements = Object.fromEntries([
@@ -80,6 +83,14 @@ elements["close-diagnostics"].addEventListener("click", () => elements["diagnost
 window.addEventListener("popstate", () => {
   const parsed = parseNavigationPath(window.location.pathname);
   void navigate(parsed.target, { history: "none", issue: parsed.issue });
+});
+window.addEventListener("keydown", (event) => {
+  const target = event.target;
+  if ((!event.ctrlKey && !event.metaKey) || event.shiftKey || event.key.toLowerCase() !== "z") return;
+  if (target?.closest?.("input, textarea, select, [contenteditable]:not([contenteditable='false']), [role='textbox']")) return;
+  if (!state.userOverrides?.available) return;
+  event.preventDefault();
+  void undoManualChange();
 });
 
 initialize();
@@ -244,6 +255,12 @@ function applyNavigationSnapshot(snapshot, historyMode, preserveScroll) {
   const previousScopeId = state.selectedScopeId;
   state.capabilities = snapshot.bootstrap.capabilities;
   state.semanticTraces = snapshot.bootstrap.semanticTraces;
+  state.userOverrides = snapshot.bootstrap.userOverrides;
+  if (state.userOverrides?.available && !document.getElementById("undo-manual-change")) {
+    const undo = create("button", "button secondary", { id: "undo-manual-change", type: "button" }, "Undo");
+    undo.addEventListener("click", () => void undoManualChange());
+    elements["refresh-button"].parentElement.append(undo);
+  }
   state.semanticTitles = snapshot.bootstrap.semanticTitles;
   state.semanticParents = snapshot.bootstrap.semanticParents;
   state.forestCapability = snapshot.bootstrap.forest;
@@ -539,7 +556,9 @@ function renderForestBranch(node, query, depth) {
   const meta = create("span", "forest-node-meta");
   meta.append(badge(node.semanticRelation, node.semanticRelation), badge(node.placementSource === "none" ? "unplaced" : node.placementSource, node.placementSource));
   if (node.nativeLineage) meta.append(badge("native origin", "native"));
-  meta.append(create("span", "forest-turn-count", {}, `${node.turnCount} Turns · ${node.traceCount} Traces`));
+  const cached = state.forestTurnCache.get(node.sessionId);
+  const traceCount = cached && !cached.loading && !cached.error ? cached.turns.filter((turn) => turn.semanticTrace?.displayText).length : node.traceCount;
+  meta.append(create("span", "forest-turn-count", {}, `${node.turnCount} Turns · ${traceCount} Traces`));
   select.append(meta);
   select.addEventListener("click", () => void selectForestSession(node.sessionId));
   card.append(select);
@@ -572,10 +591,16 @@ async function toggleForestTraces(sessionId) {
   else {
     state.expandedForestSessions.add(sessionId);
     if (!state.forestTurnCache.has(sessionId)) {
-      state.forestTurnCache.set(sessionId, { loading: true, turns: [] });
+      const pending = { loading: true, turns: [], updates: new Map() };
+      state.forestTurnCache.set(sessionId, pending);
       renderForest();
-      try { state.forestTurnCache.set(sessionId, { loading: false, turns: await loadAllForestTurns(sessionId) }); }
-      catch (error) { state.forestTurnCache.set(sessionId, { loading: false, turns: [], error: error.message }); }
+      try {
+        const turns = await loadAllForestTurns(sessionId);
+        for (const turn of turns) if (pending.updates.has(turn.id)) turn.semanticTrace = pending.updates.get(turn.id);
+        if (state.forestTurnCache.get(sessionId) === pending) state.forestTurnCache.set(sessionId, { loading: false, turns });
+      } catch (error) {
+        if (state.forestTurnCache.get(sessionId) === pending) state.forestTurnCache.set(sessionId, { loading: false, turns: [], error: error.message });
+      }
     }
   }
   renderForest();
@@ -617,35 +642,69 @@ function renderForestTraces(sessionId) {
     : `${cached.turns.length} Turns · No semantic traces yet`;
   container.append(create("p", "forest-trace-summary", {}, summary));
   if (traced.length < cached.turns.length && state.semanticTraces?.generationAvailable) {
-    const generate = create("button", "forest-node-action", { type: "button" }, traced.length ? "Generate missing traces" : "Generate traces");
+    const running = state.batchGeneration?.sessionId === sessionId;
+    const generate = create("button", "forest-node-action", { type: "button" }, running ? "Generating traces…" : traced.length ? "Generate missing traces" : "Generate traces");
+    generate.disabled = Boolean(state.batchGeneration);
     generate.addEventListener("click", async () => {
       await selectForestSession(sessionId);
       await generateSessionTraces();
     });
     container.append(generate);
   }
-  container.append(...traced.map((turn) => {
+  container.append(...cached.turns.map((turn) => {
     const item = create("button", "forest-trace-item", { type: "button" });
     item.append(create("span", "forest-trace-ordinal", {}, `T${turn.ordinal}`));
-    item.append(create("span", "forest-trace-text", {}, turn.semanticTrace.displayText));
+    item.append(create("span", "forest-trace-text", {}, turn.semanticTrace?.navigationLabel ?? turn.semanticTrace?.displayText ?? (turn.input?.replace(/\s+/g, " ").trim().slice(0, 120) || `第 ${turn.ordinal} 轮`)));
     item.addEventListener("click", () => void selectForestSession(sessionId, turn.id));
     return item;
   }));
   return container;
 }
 
+function refreshForestTraces(sessionId) {
+  const cached = state.forestTurnCache.get(sessionId);
+  for (const card of elements["forest-canvas"].querySelectorAll(".forest-node")) {
+    if (card.dataset.sessionId !== sessionId) continue;
+    if (cached && !cached.loading && !cached.error) {
+      card.querySelector(".forest-turn-count").textContent = `${cached.turns.length} Turns · ${cached.turns.filter((turn) => turn.semanticTrace?.displayText).length} Traces`;
+    }
+    const previous = card.querySelector(".forest-traces");
+    if (previous) {
+      const scrollTop = previous.scrollTop;
+      const next = renderForestTraces(sessionId);
+      previous.replaceWith(next);
+      next.scrollTop = scrollTop;
+    }
+  }
+}
+
+function applyGeneratedTrace(sessionId, turnId, semanticTrace) {
+  const cached = state.forestTurnCache.get(sessionId);
+  if (cached?.loading) cached.updates.set(turnId, semanticTrace);
+  const cachedTurn = cached?.turns.find((turn) => turn.id === turnId);
+  if (cachedTurn) cachedTurn.semanticTrace = semanticTrace;
+  refreshForestTraces(sessionId);
+  if (state.selectedSession?.providerSessionId === sessionId) {
+    const turn = state.turns.find((turn) => turn.id === turnId);
+    if (turn) turn.semanticTrace = semanticTrace;
+    const scrollTop = elements["turn-list"].scrollTop;
+    renderTranscript();
+    elements["turn-list"].scrollTop = scrollTop;
+  }
+}
+
 async function editForestTitle(sessionId) {
   await selectForestSession(sessionId);
   const session = state.selectedSession;
-  if (!session?.semanticTitle?.generatedTitle) return showToast("Generate a Semantic Session Title first; Forest never starts AI automatically.");
-  showSemanticTitleEditor(session, session.semanticTitle, elements["semantic-title-panel"]);
+  if (!session || !state.userOverrides?.available) return showToast("User override storage is unavailable.");
+  void showSemanticTitleEditor(session, session.semanticTitle ?? {}, elements["semantic-title-panel"]);
   elements["semantic-title-panel"].scrollIntoView({ block: "nearest" });
 }
 
 async function moveForestNode(sessionId) {
   await selectForestSession(sessionId);
   const session = state.selectedSession;
-  if (!session?.semanticParent?.generatedRelation) return showToast("Infer a Semantic Parent first; Forest never starts AI automatically.");
+  if (!session || !state.userOverrides?.available) return showToast("User override storage is unavailable.");
   showSemanticParentEditor(session, session.semanticParent, elements["semantic-parent-panel"]);
   elements["semantic-parent-panel"].scrollIntoView({ block: "nearest" });
 }
@@ -755,10 +814,11 @@ function renderSemanticSessionTitle(session) {
     generate.addEventListener("click", () => void generateSemanticSessionTitle(session, generate));
     actions.append(generate);
     }
-    if (title.generatedTitle) {
-      const edit = create("button", "button secondary", { type: "button" }, "Edit title");
+    if (state.userOverrides?.available) {
+      const edit = create("button", "button secondary", { type: "button" }, "Rename");
       edit.addEventListener("click", () => showSemanticTitleEditor(session, title, panel));
       actions.append(edit);
+      if (title.userTitle) actions.append(restoreAutomaticButton(session, "title"));
     }
   }
   head.append(actions);
@@ -768,7 +828,7 @@ function renderSemanticSessionTitle(session) {
   panel.append(original);
   const semantic = create("div", "semantic-title-row");
   semantic.append(create("span", "semantic-title-row-label", {}, title.userTitle ? "Preferred user title" : "Semantic title"));
-  semantic.append(create("p", title.generatedTitle ? "semantic-title-value" : "semantic-title-placeholder", {}, title.displayTitle && title.generatedTitle
+  semantic.append(create("p", title.userTitle || title.generatedTitle ? "semantic-title-value" : "semantic-title-placeholder", {}, title.displayTitle && (title.userTitle || title.generatedTitle)
     ? title.displayTitle
     : state.semanticTitles?.available ? "Not generated yet." : state.semanticTitles?.reason ?? "Semantic Session Title is unavailable."));
   panel.append(semantic);
@@ -798,31 +858,30 @@ async function generateSemanticSessionTitle(session, button) {
   }
 }
 
-function showSemanticTitleEditor(session, title, panel) {
+async function showSemanticTitleEditor(session, title, panel) {
+  let override;
+  try { override = (await readManualOverride(session, "title")).override; }
+  catch (error) { return showToast(error.message); }
   const editor = create("div", "semantic-title-editor");
   const input = create("input", "semantic-title-input", { type: "text", maxlength: "80", "aria-label": "Edited Semantic Session Title" });
-  input.value = title.userTitle ?? title.generatedTitle;
+  input.value = override.value?.title ?? title.generatedTitle ?? session.originalTitle ?? session.title;
   const save = create("button", "button primary", { type: "button" }, "Save title");
   const cancel = create("button", "button secondary", { type: "button" }, "Cancel");
-  save.addEventListener("click", () => void saveSemanticSessionTitle(session, input.value));
+  save.addEventListener("click", () => void saveSemanticSessionTitle(session, input.value, override.revision));
   cancel.addEventListener("click", () => renderSemanticSessionTitle(session));
   editor.append(input, save, cancel);
   panel.append(editor);
   input.focus();
 }
 
-async function saveSemanticSessionTitle(session, userTitle) {
+async function saveSemanticSessionTitle(session, userTitle, revision) {
   try {
-    const result = await api(`/api/sessions/${encodeURIComponent(session.providerSessionId)}/semantic-title/edit`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title: userTitle }),
-    });
+    const result = await writeManualOverride(session, "title", { title: userTitle }, revision);
     applySemanticTitleToSession(session.providerSessionId, result.semanticTitle);
     await loadForest(true);
     renderSessions();
     renderTranscript();
-    showToast("Semantic Session Title edited");
+    showManualUndo("Session renamed", result.edit);
   } catch (error) { showToast(error.message); }
 }
 
@@ -861,11 +920,15 @@ function renderSemanticParent(session) {
     if (parent.generatedRelation) {
       const accept = create("button", "button secondary", { type: "button" }, "Accept");
       accept.addEventListener("click", () => void reviewSemanticParent(session, parent.generatedRelation, parent.generatedParentSessionId));
+      actions.append(accept);
+    }
+    if (state.userOverrides?.available) {
       const change = create("button", "button secondary", { type: "button" }, "Change parent");
       change.addEventListener("click", () => showSemanticParentEditor(session, parent, panel));
       const root = create("button", "button secondary", { type: "button" }, "Set root");
       root.addEventListener("click", () => void reviewSemanticParent(session, "root"));
-      actions.append(accept, change, root);
+      actions.append(change, root);
+      if (parent.authority === "user") actions.append(restoreAutomaticButton(session, "parent"));
     }
   }
   head.append(actions);
@@ -907,14 +970,27 @@ async function inferSemanticParent(session, button) {
   }
 }
 
-function showSemanticParentEditor(session, parent, panel) {
+async function showSemanticParentEditor(session, parent = {}, panel) {
+  let override, candidates;
+  try {
+    const results = await Promise.all([readManualOverride(session, "parent"), api(`/api/sessions/${encodeURIComponent(session.providerSessionId)}/manual-parents`)]);
+    override = results[0].override;
+    candidates = results[1].candidates;
+  } catch (error) { return showToast(error.message); }
   const editor = create("div", "semantic-parent-editor");
+  const search = create("input", "semantic-title-input", { type: "search", placeholder: "Filter legal parent titles…", "aria-label": "Filter legal parent titles" });
   const select = create("select", "semantic-parent-select", { "aria-label": "Semantic Parent Session" });
-  for (const candidate of parent.candidates ?? []) {
-    const option = create("option", "", { value: candidate.sessionId }, candidate.title);
+  const suggested = new Set((parent.candidates ?? []).map((candidate) => candidate.sessionId));
+  candidates.sort((a, b) => Number(suggested.has(b.sessionId)) - Number(suggested.has(a.sessionId)));
+  const populate = () => {
+  select.replaceChildren();
+  for (const candidate of candidates.filter((item) => item.title.toLocaleLowerCase().includes(search.value.toLocaleLowerCase()))) {
+    const option = create("option", "", { value: candidate.sessionId }, `${suggested.has(candidate.sessionId) ? "Suggested · " : ""}${candidate.title}`);
     if (candidate.sessionId === parent.parentSessionId) option.selected = true;
     select.append(option);
   }
+  };
+  populate();
   const relation = create("select", "semantic-parent-select", { "aria-label": "Semantic relation" });
   for (const value of ["continuation", "subtask"]) {
     const option = create("option", "", { value }, value);
@@ -924,23 +1000,21 @@ function showSemanticParentEditor(session, parent, panel) {
   const save = create("button", "button primary", { type: "button" }, "Save relationship");
   const cancel = create("button", "button secondary", { type: "button" }, "Cancel");
   save.disabled = !select.value;
-  save.addEventListener("click", () => void reviewSemanticParent(session, relation.value, select.value));
+  search.addEventListener("input", () => { populate(); save.disabled = !select.value; });
+  save.addEventListener("click", () => void reviewSemanticParent(session, relation.value, select.value, override.revision));
   cancel.addEventListener("click", () => renderSemanticParent(session));
-  editor.append(select, relation, save, cancel);
+  editor.append(search, select, relation, save, cancel);
   panel.append(editor);
 }
 
-async function reviewSemanticParent(session, relation, parentSessionId) {
+async function reviewSemanticParent(session, relation, parentSessionId, revision) {
   try {
-    const result = await api(`/api/sessions/${encodeURIComponent(session.providerSessionId)}/semantic-parent/review`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ relation, parentSessionId }),
-    });
+    revision ??= (await readManualOverride(session, "parent")).override.revision;
+    const result = await writeManualOverride(session, "parent", { relation, parentSessionId }, revision);
     applySemanticParentToSession(session.providerSessionId, result.semanticParent);
     await loadForest(true);
     renderTranscript();
-    showToast(relation === "root" ? "Session set as semantic root" : "Semantic relationship saved");
+    showManualUndo(relation === "root" ? "Session set as root" : "Session moved", result.edit);
   } catch (error) { showToast(error.message); }
 }
 
@@ -1015,7 +1089,7 @@ function renderSemanticTrace(turn) {
     wrapper.append(create("p", "semantic-trace-text", {}, displayText));
     const metadata = [value.model, value.generatedAt ? `generated ${formatDate(value.generatedAt)}` : undefined].filter(Boolean).join(" · ");
     if (metadata) wrapper.append(create("p", "semantic-trace-meta", {}, metadata));
-    if (value.userFeedback?.verdict === "edited") wrapper.append(aiOriginalDetails(value));
+    if (value.text && value.userFeedback?.verdict === "edited") wrapper.append(aiOriginalDetails(value));
   } else {
     wrapper.append(create("p", "semantic-trace-placeholder", {}, value.availability === "available"
       ? "No trace generated for this Turn."
@@ -1030,7 +1104,7 @@ function renderSemanticTrace(turn) {
     });
     wrapper.append(action);
   }
-  if (value.text) wrapper.append(renderTraceFeedback(turn, value));
+  if (value.text || state.userOverrides?.available) wrapper.append(renderTraceFeedback(turn, value));
   return wrapper;
 }
 
@@ -1048,7 +1122,7 @@ function aiOriginalDetails(value) {
 function renderTraceFeedback(turn, value) {
   const actions = create("div", "trace-feedback");
   const accept = create("button", "trace-feedback-button", { type: "button" }, "Accept");
-  const edit = create("button", "trace-feedback-button", { type: "button" }, "Edit");
+  const edit = create("button", "trace-feedback-button", { type: "button" }, "Edit label");
   const reject = create("button", "trace-feedback-button", { type: "button" }, "Reject");
   if (value.userFeedback?.verdict === "accepted") accept.classList.add("active");
   if (value.userFeedback?.verdict === "edited") edit.classList.add("active");
@@ -1056,18 +1130,31 @@ function renderTraceFeedback(turn, value) {
   accept.addEventListener("click", (event) => { event.stopPropagation(); void saveTraceFeedback(turn, "accepted"); });
   reject.addEventListener("click", (event) => { event.stopPropagation(); void saveTraceFeedback(turn, "rejected"); });
   edit.addEventListener("click", (event) => { event.stopPropagation(); showTraceEditor(turn, value, actions); });
-  actions.append(accept, edit, reject);
+  if (value.text) actions.append(accept, reject);
+  if (state.userOverrides?.available) actions.append(edit);
+  if (value.userLabel || value.userFeedback?.verdict === "edited") actions.append(restoreAutomaticButton({ providerSessionId: turn.sessionId ?? state.selectedSession?.providerSessionId }, "label", turn.id));
   return actions;
 }
 
-function showTraceEditor(turn, value, actions) {
+async function showTraceEditor(turn, value, actions) {
+  const session = { providerSessionId: turn.sessionId ?? state.selectedSession?.providerSessionId };
+  let override;
+  try { override = (await readManualOverride(session, "label", turn.id)).override; }
+  catch (error) { return showToast(error.message); }
   const editor = create("div", "trace-editor");
   const input = create("textarea", "trace-editor-input", { maxlength: "240", rows: "3", "aria-label": "Edited Semantic Trace" });
-  input.value = value.userFeedback?.editedText ?? value.displayText ?? value.text;
+  input.value = override.value?.label ?? value.navigationLabel ?? value.displayText ?? value.text ?? "";
   const controls = create("div", "trace-editor-controls");
   const save = create("button", "trace-feedback-button active", { type: "button" }, "Save edit");
   const cancel = create("button", "trace-feedback-button", { type: "button" }, "Cancel");
-  save.addEventListener("click", (event) => { event.stopPropagation(); void saveTraceFeedback(turn, "edited", input.value); });
+  save.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    try {
+      const result = await writeManualOverride(session, "label", { label: input.value }, override.revision, turn.id);
+      applyGeneratedTrace(session.providerSessionId, turn.id, result.semanticTrace);
+      showManualUndo("Turn label saved", result.edit);
+    } catch (error) { showToast(error.message); }
+  });
   cancel.addEventListener("click", (event) => { event.stopPropagation(); editor.replaceWith(renderTraceFeedback(turn, value)); });
   controls.append(save, cancel);
   editor.append(input, controls);
@@ -1114,8 +1201,18 @@ async function generateSessionTraces() {
   const batch = { sessionId, label: "Loading all Turns…", generated: 0, warnings: 0, failed: 0, reused: 0 };
   state.batchGeneration = batch;
   renderBatchGenerationState(sessionId);
+  for (const id of state.expandedForestSessions) refreshForestTraces(id);
   try {
     const turns = await loadAllSessionTurns(sessionId);
+    state.forestTurnCache.set(sessionId, { loading: false, turns });
+    refreshForestTraces(sessionId);
+    if (state.selectedSession?.providerSessionId === sessionId) {
+      const byId = new Map(turns.map((turn) => [turn.id, turn]));
+      for (const turn of state.turns) if (byId.has(turn.id)) turn.semanticTrace = byId.get(turn.id).semanticTrace;
+      const scrollTop = elements["turn-list"].scrollTop;
+      renderTranscript();
+      elements["turn-list"].scrollTop = scrollTop;
+    }
     const candidates = turns.filter((turn) => turn.semanticTrace?.freshness === "missing" || turn.semanticTrace?.freshness === "stale");
     batch.reused = turns.length - candidates.length;
     batch.label = candidates.length ? `0 / ${candidates.length} generated` : `0 generated · ${batch.reused} current reused`;
@@ -1123,6 +1220,7 @@ async function generateSessionTraces() {
     for (const [index, turn] of candidates.entries()) {
       try {
         const result = await api(`/api/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turn.id)}/semantic-trace`, { method: "POST" });
+        applyGeneratedTrace(sessionId, turn.id, result.semanticTrace);
         batch.generated += 1;
         if (result.semanticTrace.safetyWarning || result.semanticTrace.languageMismatch) batch.warnings += 1;
       } catch { batch.failed += 1; }
@@ -1130,11 +1228,6 @@ async function generateSessionTraces() {
       renderBatchGenerationState(state.selectedSession?.providerSessionId);
     }
     batch.label = `${batch.generated} generated · ${batch.warnings} warnings · ${batch.failed} failed · ${batch.reused} current reused`;
-    if (state.selectedSession?.providerSessionId === sessionId) {
-      const target = currentTarget();
-      const scrollTop = elements["turn-list"].scrollTop;
-      await navigate(target, { history: "none", preserveScroll: scrollTop });
-    }
     showToast(batch.label);
   } catch (error) {
     batch.label = `Session batch failed to start: ${error.message}`;
@@ -1143,6 +1236,7 @@ async function generateSessionTraces() {
     state.batchSummary = { sessionId, label: batch.label };
     state.batchGeneration = undefined;
     renderBatchGenerationState(state.selectedSession?.providerSessionId);
+    for (const id of state.expandedForestSessions) refreshForestTraces(id);
   }
 }
 
@@ -1163,13 +1257,13 @@ async function loadAllSessionTurns(sessionId) {
 
 async function generateSemanticTrace(turn, action) {
   if (!state.selectedSession) return;
+  const sessionId = turn.sessionId ?? state.selectedSession.providerSessionId;
   action.disabled = true;
   action.textContent = "Generating locally…";
-  const scrollTop = elements["turn-list"].scrollTop;
   try {
     const force = turn.semanticTrace?.text ? "?force=1" : "";
-    const result = await api(`/api/sessions/${encodeURIComponent(state.selectedSession.providerSessionId)}/turns/${encodeURIComponent(turn.id)}/semantic-trace${force}`, { method: "POST" });
-    await navigate(currentTarget(), { history: "none", preserveScroll: scrollTop });
+    const result = await api(`/api/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turn.id)}/semantic-trace${force}`, { method: "POST" });
+    applyGeneratedTrace(sessionId, turn.id, result.semanticTrace);
     showToast(result.semanticTrace.safetyWarning ? "Trace generated with a safety warning" : "Semantic Trace generated");
   } catch (error) {
     showToast(error.message);
@@ -1300,4 +1394,64 @@ function showToast(message) {
   elements.toast.hidden = false;
   window.clearTimeout(showToast.timer);
   showToast.timer = window.setTimeout(() => { elements.toast.hidden = true; }, 3200);
+}
+
+function manualOverridePath(session, field, turnId) {
+  return `/api/sessions/${encodeURIComponent(session.providerSessionId)}/user-overrides/${field}${turnId ? `?turnId=${encodeURIComponent(turnId)}` : ""}`;
+}
+
+function readManualOverride(session, field, turnId) {
+  return api(manualOverridePath(session, field, turnId));
+}
+
+function writeManualOverride(session, field, value, revision, turnId) {
+  return api(manualOverridePath(session, field, turnId), {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ value, revision }),
+  });
+}
+
+function showManualUndo(message, edit) {
+  state.lastManualEdit = edit;
+  showToast(message);
+  const undo = create("button", "button secondary", { type: "button" }, "Undo");
+  undo.addEventListener("click", () => void undoManualChange());
+  elements.toast.append(undo);
+  window.clearTimeout(showToast.timer);
+}
+
+function restoreAutomaticButton(session, field, turnId) {
+  const button = create("button", "button secondary", { type: "button" }, "Restore automatic");
+  button.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    try {
+      const { override } = await readManualOverride(session, field, turnId);
+      const result = await writeManualOverride(session, field, null, override.revision, turnId);
+      if (field === "title") applySemanticTitleToSession(session.providerSessionId, result.semanticTitle);
+      if (field === "parent") applySemanticParentToSession(session.providerSessionId, result.semanticParent);
+      if (field === "label") applyGeneratedTrace(session.providerSessionId, turnId, result.semanticTrace);
+      else { await loadForest(true); renderSessions(); renderTranscript(); }
+      showManualUndo("Automatic suggestion restored", result.edit);
+    } catch (error) { showToast(error.message); }
+  });
+  return button;
+}
+
+async function undoManualChange() {
+  if (state.undoBusy || !state.selectedScopeId) return;
+  state.undoBusy = true;
+  try {
+    let edit = state.lastManualEdit?.workspace === state.selectedScopeId ? state.lastManualEdit : undefined;
+    edit ??= (await api(`/api/scopes/${encodeURIComponent(state.selectedScopeId)}/user-edits/latest`)).edit;
+    if (!edit) return showToast("No recent manual change to undo.");
+    await api(`/api/user-edits/${encodeURIComponent(edit.id)}/undo`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ revision: edit.revision }),
+    });
+    state.lastManualEdit = undefined;
+    state.forestTurnCache.delete(edit.sessionId);
+    if (state.expandedForestSessions.has(edit.sessionId)) state.forestTurnCache.set(edit.sessionId, { loading: false, turns: await loadAllForestTurns(edit.sessionId) });
+    await navigate(currentTarget(), { history: "none", preserveScroll: elements["turn-list"].scrollTop });
+    await loadForest(true);
+    showToast("Manual change undone");
+  } catch (error) { showToast(error.message); }
+  finally { state.undoBusy = false; }
 }

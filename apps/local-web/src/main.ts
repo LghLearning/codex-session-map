@@ -16,6 +16,8 @@ import {
   DEFAULT_OLLAMA_ENDPOINT,
   DEFAULT_OLLAMA_MODEL,
   preferredSessionDisplayTitle,
+  semanticSessionContentFingerprint,
+  type SemanticSessionProjection,
   selectSemanticParentCandidates,
   SEMANTIC_STORE_SCHEMA_VERSION,
   type SemanticTraceCompletionClient,
@@ -47,6 +49,7 @@ const app = createLocalWebServer({
   semanticTraces: semantic?.service,
   semanticTitles: semantic?.titles,
   semanticParents: semantic?.parents,
+  userOverrides: semantic?.store,
   forest: forestProjection?.forest,
   organizer: semantic?.generationAvailable ? semantic.organizer : undefined,
   semanticGenerationAvailable: semantic?.generationAvailable ?? false,
@@ -67,7 +70,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, async 
   process.exit(0);
 });
 
-async function createSemanticPreview(values: readonly string[]): Promise<{ service: LocalWebSemanticTraces; titles: LocalWebSemanticTitles; parents: LocalWebSemanticParents; organizer: LocalWebOrganizer; generationAvailable: boolean; modelIdentity?: string; close(): Promise<void> } | undefined> {
+async function createSemanticPreview(values: readonly string[]): Promise<{ store: SqliteSemanticTraceStore; service: LocalWebSemanticTraces; titles: LocalWebSemanticTitles; parents: LocalWebSemanticParents; organizer: LocalWebOrganizer; generationAvailable: boolean; modelIdentity?: string; close(): Promise<void> } | undefined> {
   try {
     const databasePath = resolve(valueAfter(values, "--semantic-store") ?? ".codex-session-map/semantic-traces.sqlite");
     await mkdir(dirname(databasePath), { recursive: true });
@@ -117,7 +120,15 @@ async function createSemanticPreview(values: readonly string[]): Promise<{ servi
       if (!current) throw new Error("Current Session is unavailable in its Workspace projection.");
       const nativeLineage = await adapter.getNativeLineage(session.providerSessionId);
       const candidates = selectSemanticParentCandidates({ current, sessions: projections, nativeLineage });
-      return { source: { current, candidates }, sessions, nativeLineage };
+      const fingerprintProjection = async (projection: SemanticSessionProjection): Promise<SemanticSessionProjection> => ({
+        ...projection,
+        sourceContentFingerprint: semanticSessionContentFingerprint(await listAllTurns(projection.sessionId)),
+      });
+      const [fingerprintedCurrent, fingerprintedCandidates] = await Promise.all([
+        fingerprintProjection(current),
+        Promise.all(candidates.map(async (candidate) => ({ ...candidate, projection: await fingerprintProjection(candidate.projection) }))),
+      ]);
+      return { source: { current: fingerprintedCurrent, candidates: fingerprintedCandidates }, sessions, nativeLineage };
     };
     const listAllSessions = async (scopeId: string): Promise<Session[]> => {
       const sessions: Session[] = [];
@@ -150,6 +161,7 @@ async function createSemanticPreview(values: readonly string[]): Promise<{ servi
       await parentService.generate(context.source, context.sessions);
     };
     return {
+      store,
       generationAvailable,
       modelIdentity: generationAvailable ? runtime.model : undefined,
       service: {
@@ -186,7 +198,7 @@ async function createSemanticPreview(values: readonly string[]): Promise<{ servi
         readStored: (session) => titleService.readStored(session.providerId, session.providerSessionId),
         inspect: async (session, turns) => {
           const lookup = await titleService.inspect(await titleSource(session, turns));
-          return !generationAvailable && lookup.title
+          return !generationAvailable && lookup.title?.generatedTitle
             ? { ...lookup, freshness: lookup.title.sourceFingerprint === lookup.currentSourceFingerprint ? "current" : "stale" }
             : lookup;
         },
@@ -198,7 +210,7 @@ async function createSemanticPreview(values: readonly string[]): Promise<{ servi
           const context = await parentContext(session);
           const lookup = await parentService.inspect(context.source);
           return {
-            lookup: !generationAvailable && lookup.edge
+            lookup: !generationAvailable && lookup.edge?.generatedRelation
               ? { ...lookup, freshness: lookup.edge.sourceFingerprint === lookup.currentSourceFingerprint ? "current" : "stale" }
               : lookup,
             candidates: context.source.candidates, nativeLineage: context.nativeLineage,
@@ -220,7 +232,7 @@ async function createSemanticPreview(values: readonly string[]): Promise<{ servi
           });
           const lookup = await parentService.inspect(context.source);
           return {
-            lookup: !generationAvailable && lookup.edge
+            lookup: !generationAvailable && lookup.edge?.generatedRelation
               ? { ...lookup, freshness: lookup.edge.sourceFingerprint === lookup.currentSourceFingerprint ? "current" : "stale" }
               : lookup,
             edge, candidates: context.source.candidates, nativeLineage: context.nativeLineage,
@@ -296,7 +308,9 @@ async function createForestProjection(values: readonly string[]): Promise<{ fore
               store.listSession(session.providerId, session.providerSessionId),
               countTurns(session.providerSessionId),
             ]);
-            return { session, semanticTitle, semanticParent, nativeLineage, turnCount, traceCount: traces.length };
+            const labelled = store.overrides.list(session.providerId, "label", session.providerSessionId).filter((item) => item.value?.label);
+            const traceCount = new Set([...traces.map((trace) => trace.nativeTurnId), ...labelled.map((item) => item.nativeTurnId)]).size;
+            return { session, semanticTitle, semanticParent, nativeLineage, turnCount, traceCount };
           }));
           return materializeSessionForest(scopeId, inputs);
         },

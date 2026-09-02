@@ -1,5 +1,6 @@
 import type { SemanticTraceCompletionClient, SemanticTraceCompletionRequest } from "./prompt-generator.ts";
 import type { Session, Turn, TurnSemanticTrace } from "../../core/src/index.ts";
+import { semanticSessionContentFingerprint } from "./index.ts";
 import type {
   GeneratedSemanticSessionTitle,
   SemanticSessionTitleGenerator,
@@ -78,6 +79,7 @@ export function assembleSemanticSessionTitleSource(options: {
     providerId: options.session.providerId,
     sessionId: options.session.providerSessionId,
     originalTitle: options.session.title,
+    sourceContentFingerprint: semanticSessionContentFingerprint(options.turns),
     firstUserInput: options.turns.find((turn) => turn.initiatorKind === "user" && turn.input.text)?.input.text,
     semanticTraces: options.turns.flatMap((turn) => {
       const trace = traces.get(turn.nativeTurnId);
