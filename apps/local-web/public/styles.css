@@ -117,6 +117,11 @@ body.forest-mode .explorer { grid-template-columns: minmax(190px, .58fr) minmax(
 .forest-traces { max-height: 230px; margin-top: 8px; padding-top: 7px; display: grid; gap: 4px; overflow: auto; border-top: 1px solid var(--line); }
 .forest-trace-summary { margin: 0; color: var(--muted); font-size: 9px; }
 .forest-trace-item { padding: 5px 6px; display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 5px; border: 0; border-radius: 5px; background: var(--bg); cursor: pointer; text-align: left; }
+.forest-trace-content, .forest-turn-branches { min-width: 0; display: grid; gap: 3px; }
+.forest-turn-branches { margin-top: 3px; padding-left: 8px; border-left: 1px solid var(--accent); }
+.forest-turn-branch { color: var(--accent); font-size: 8px; line-height: 1.35; overflow-wrap: anywhere; }
+.forest-session-branches { padding: 5px 6px; display: grid; grid-template-columns: 40px minmax(0, 1fr); gap: 5px; border-radius: 5px; background: var(--bg); white-space: pre-line; }
+.forest-anchor-unavailable { margin: 0; color: var(--warning); font-size: 8px; overflow-wrap: anywhere; }
 .forest-trace-ordinal { color: var(--muted); font: 700 8px/1.4 ui-monospace, monospace; }
 .forest-trace-text, .forest-trace-missing { color: var(--ink); font-size: 9px; line-height: 1.4; overflow-wrap: anywhere; }
 .forest-trace-missing { color: var(--muted); }

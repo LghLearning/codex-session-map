@@ -10,6 +10,8 @@ export interface UserValue {
   label?: string;
   relation?: SemanticParentRelation;
   parentSessionId?: string;
+  /** Stable Turn identity inside parentSessionId; semantic organization, never native provenance. */
+  anchorTurnId?: string;
   feedback?: { verdict: "accepted" | "edited" | "rejected"; aiOriginalText: string; editedText?: string; sourceFingerprint: string; reviewedAt: string };
 }
 export interface UserOverride extends UserKey { workspace: string; value: UserValue | null; revision: number; updatedAt: string }
@@ -76,7 +78,10 @@ export class UserOverrides {
       .get(key.providerId, key.sessionId) as any;
     const relation = value?.relation ?? generated?.generated_relation;
     const parentId = value?.relation ? value.parentSessionId : generated?.generated_parent_session_id ?? undefined;
+    const anchorTurnId = value?.relation ? value.anchorTurnId : undefined;
     if (!relation) return; // Restoring an item with no AI suggestion means Unorganized.
+    if (relation === "root" && anchorTurnId) throw new UserEditError("A root Semantic Placement cannot include a Turn anchor.");
+    if (anchorTurnId && !parentId) throw new UserEditError("A Turn anchor requires a parent Session.");
     try { validateSemanticEdge(key.sessionId, parentId, relation, sessions); }
     catch (error) { throw new UserEditError((error as Error).message); }
     if (relation === "root") return;

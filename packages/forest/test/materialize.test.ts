@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { Session } from "../../core/src/index.ts";
-import { materializeSessionForest, type ForestSessionInput } from "../src/index.ts";
+import { materializeSessionForest, projectSessionBranches, type BranchTurn, type ForestSessionInput } from "../src/index.ts";
 
 test("forest includes every Session, supports multiple roots, and applies title/parent authority", () => {
   const inputs: ForestSessionInput[] = [
@@ -47,6 +47,31 @@ test("cycle-safe projection breaks corrupt semantic cycles without changing nati
   assert.equal(forest.stats.unorganized, 1);
   assert.equal(forest.issues[0]?.code, "cycle_broken");
   assert.deepEqual(find([...forest.roots, ...forest.unorganized], "a")?.nativeLineage, native);
+});
+
+test("branch projection keeps Turn order, supports shared anchors, missing anchors, and native/semantic separation", () => {
+  const inputs: ForestSessionInput[] = [
+    input("a"), input("c"),
+    input("b", {
+      semanticParent: { userRelation: "subtask", userParentSessionId: "c", userAnchorTurnId: "c/t7" },
+      nativeLineage: { providerId: "fixture", sessionId: "b", parentSessionId: "a", originTurnId: "a/t3", kind: "user_fork", recovery: "exact" },
+    }),
+    input("d", { semanticParent: { userRelation: "continuation", userParentSessionId: "a", userAnchorTurnId: "a/t3" } }),
+    input("e", { semanticParent: { userRelation: "subtask", userParentSessionId: "a", userAnchorTurnId: "missing" } }),
+    input("f", { semanticParent: { userRelation: "continuation", userParentSessionId: "a" } }),
+  ];
+  const turns = new Map<string, readonly BranchTurn[]>([
+    ["a", [{ nativeTurnId: "a/t1", displayOrdinal: 1, displayLabel: "A1" }, { nativeTurnId: "a/t3", displayOrdinal: 3, displayLabel: "A3" }]],
+    ["c", [{ nativeTurnId: "c/t7", displayOrdinal: 7, displayLabel: "C7" }]],
+  ]);
+  const projected = projectSessionBranches(inputs, turns);
+  const a = projected.find((item) => item.sessionId === "a")!;
+  const c = projected.find((item) => item.sessionId === "c")!;
+  assert.deepEqual(a.turns.map((item) => item.nativeTurnId), ["a/t1", "a/t3"]);
+  assert.deepEqual(a.turns[1].childSessions.map((item) => [item.childSessionId, item.source]), [["b", "native"], ["d", "user"]]);
+  assert.deepEqual(a.sessionLevelChildren.map((item) => item.childSessionId), ["f"]);
+  assert.deepEqual(a.unavailableAnchors.map((item) => item.childSessionId), ["e"]);
+  assert.deepEqual(c.turns[0].childSessions.map((item) => [item.childSessionId, item.source]), [["b", "user"]]);
 });
 
 function input(id: string, overrides: Partial<ForestSessionInput> = {}): ForestSessionInput {

@@ -48,6 +48,7 @@ export interface SemanticParentEdge {
   readonly sourceFingerprint?: string;
   readonly generatedAt?: string;
   readonly userParentSessionId?: string;
+  readonly userAnchorTurnId?: string;
   readonly userRelation?: SemanticParentRelation;
   readonly userReviewedAt?: string;
 }
@@ -68,11 +69,13 @@ export interface SemanticParentStore {
     parentSessionId: string | undefined,
     relation: SemanticParentRelation,
     reviewedAt: string,
+    anchorTurnId?: string,
   ): Promise<void>;
 }
 
 export interface SemanticParentDisplay {
   readonly parentSessionId?: string;
+  readonly anchorTurnId?: string;
   readonly relation?: SemanticParentRelation;
   readonly authority: "ai" | "user" | "none";
 }
@@ -154,8 +157,11 @@ export class SemanticParentService {
     childSessionId: string;
     parentSessionId?: string;
     relation: SemanticParentRelation;
+    anchorTurnId?: string;
     sessions: readonly Session[];
   }): Promise<SemanticParentEdge> {
+    if (options.relation === "root" && options.anchorTurnId) throw new Error("A root Semantic Placement cannot include a Turn anchor.");
+    if (options.anchorTurnId && !options.parentSessionId) throw new Error("A Turn anchor requires a parent Session.");
     validateSemanticEdge(options.childSessionId, options.parentSessionId, options.relation, options.sessions);
     await this.#assertAcyclic(options.providerId, options.childSessionId, options.parentSessionId, options.relation);
     await this.#store.putUserSemanticParent(
@@ -164,6 +170,7 @@ export class SemanticParentService {
       options.parentSessionId,
       options.relation,
       this.#now().toISOString(),
+      options.anchorTurnId,
     );
     const updated = await this.#store.getSemanticParent(options.providerId, options.childSessionId);
     if (!updated) throw new Error("Semantic Parent was not found after review.");
@@ -187,6 +194,7 @@ export class SemanticParentService {
       sourceFingerprint: semanticParentSourceFingerprint(source),
       generatedAt: this.#now().toISOString(),
       userParentSessionId: previous?.userParentSessionId,
+      userAnchorTurnId: previous?.userAnchorTurnId,
       userRelation: previous?.userRelation,
       userReviewedAt: previous?.userReviewedAt,
     };
@@ -322,7 +330,12 @@ export function semanticParentSourceFingerprint(source: SemanticParentInferenceS
 }
 
 export function preferredSemanticParent(edge: SemanticParentEdge): SemanticParentDisplay {
-  if (edge.userRelation) return { parentSessionId: edge.userParentSessionId, relation: edge.userRelation, authority: "user" };
+  if (edge.userRelation) return {
+    parentSessionId: edge.userParentSessionId,
+    ...(edge.userAnchorTurnId ? { anchorTurnId: edge.userAnchorTurnId } : {}),
+    relation: edge.userRelation,
+    authority: "user",
+  };
   return { parentSessionId: edge.generatedParentSessionId, relation: edge.generatedRelation, authority: edge.generatedRelation ? "ai" : "none" };
 }
 

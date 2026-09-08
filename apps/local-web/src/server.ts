@@ -99,7 +99,7 @@ export interface LocalWebSemanticParentResult {
 export interface LocalWebSemanticParents {
   inspect(session: Session): Promise<LocalWebSemanticParentResult>;
   generate(session: Session): Promise<LocalWebSemanticParentResult>;
-  review(session: Session, review: { parentSessionId?: string; relation: SemanticParentRelation }): Promise<LocalWebSemanticParentResult>;
+  review(session: Session, review: { parentSessionId?: string; anchorTurnId?: string; relation: SemanticParentRelation }): Promise<LocalWebSemanticParentResult>;
 }
 
 export interface LocalWebForest {
@@ -232,6 +232,10 @@ async function handleApi(options: LocalWebServerOptions, request: IncomingMessag
       const body = await readJsonBody(request);
       const value = parseUserValue(field, body.value);
       const sessions = field === "parent" ? await loadManualSessions(provider, session.workspaceScopeId) : undefined;
+      if (field === "parent" && value?.anchorTurnId) {
+        if (!value.parentSessionId) throw new UserEditError("A Turn anchor requires a parent Session.");
+        await validateTurnAnchor(provider, session, value.parentSessionId, value.anchorTurnId);
+      }
       edit = store.overrides.write(key, session.workspaceScopeId, value, requireRevision(body.revision), sessions);
     }
     const override = store.overrides.read(key) ?? { ...key, value: null, revision: 0 };
@@ -239,7 +243,11 @@ async function handleApi(options: LocalWebServerOptions, request: IncomingMessag
       override, edit,
       semanticTitle: field === "title" ? projectSemanticTitle(session.title, await store.getSessionTitle(session.providerId, session.providerSessionId)) : undefined,
       semanticTrace: turn ? await inspectSemanticTrace(turn, options.semanticTraces) : undefined,
-      semanticParent: field === "parent" ? projectSemanticParent({ lookup: { freshness: "missing", currentSourceFingerprint: "", edge: await store.getSemanticParent(session.providerId, session.providerSessionId) }, candidates: [], nativeLineage: null }) : undefined,
+      semanticParent: field === "parent" ? projectSemanticParent({
+        lookup: { freshness: "missing", currentSourceFingerprint: "", edge: await store.getSemanticParent(session.providerId, session.providerSessionId) },
+        candidates: [],
+        nativeLineage: await provider.getNativeLineage(session.providerSessionId),
+      }) : undefined,
     });
   }
   if (request.method === "POST" && url.pathname === "/api/refresh") {
@@ -331,7 +339,12 @@ async function handleApi(options: LocalWebServerOptions, request: IncomingMessag
     const body = await readJsonBody(request);
     const relation = parseSemanticParentRelation(body.relation);
     const parentSessionId = typeof body.parentSessionId === "string" && body.parentSessionId.trim() ? body.parentSessionId.trim() : undefined;
-    const result = await options.semanticParents.review(session, { relation, parentSessionId });
+    const anchorTurnId = typeof body.anchorTurnId === "string" && body.anchorTurnId.trim() ? body.anchorTurnId.trim() : undefined;
+    if (anchorTurnId) {
+      if (!parentSessionId) throw new UserEditError("A Turn anchor requires a parent Session.");
+      await validateTurnAnchor(provider, session, parentSessionId, anchorTurnId);
+    }
+    const result = await options.semanticParents.review(session, { relation, parentSessionId, anchorTurnId });
     return sendJson(response, 200, { semanticParent: projectSemanticParent(result) });
   }
   const organizeStartMatch = url.pathname.match(/^\/api\/scopes\/([^/]+)\/organize$/);
@@ -462,6 +475,25 @@ async function handleApi(options: LocalWebServerOptions, request: IncomingMessag
     return sendJson(response, 200, { forest });
   }
 
+  const turnDirectoryMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/turn-directory$/);
+  if (turnDirectoryMatch) {
+    if (request.method !== "GET" && request.method !== "HEAD") return sendProblem(response, 405, "method_not_allowed", "Turn directory access is read-only.");
+    const sessionId = decodePathPart(turnDirectoryMatch[1]);
+    const turns = await loadWindow(
+      (cursor) => provider.listTurns(sessionId, cursor),
+      url.searchParams.get("cursor") ?? undefined,
+      pageSize,
+      () => true,
+    );
+    return sendJson(response, 200, {
+      ...turns,
+      data: await Promise.all(turns.data.map(async (turn) => {
+        const semantic = await inspectSemanticTrace(turn, options.semanticTraces);
+        return { nativeTurnId: turn.nativeTurnId, displayOrdinal: turn.displayOrdinal, displayLabel: semantic.navigationLabel };
+      })),
+    });
+  }
+
   const turnMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/turns\/([^/]+)$/);
   if (turnMatch) {
     const turn = await findTurn(provider, decodePathPart(turnMatch[1]), decodePathPart(turnMatch[2]));
@@ -519,6 +551,20 @@ async function findTurn(provider: LocalWebProvider, sessionId: string, turnId: s
     cursor = page.nextCursor;
   } while (cursor);
   throw new TurnNotFoundError("Unknown session turn");
+}
+
+async function validateTurnAnchor(provider: LocalWebProvider, child: Session, parentSessionId: string, anchorTurnId: string): Promise<void> {
+  let anchor: Turn;
+  try { anchor = await findTurn(provider, parentSessionId, anchorTurnId); }
+  catch (error) {
+    if (error instanceof TurnNotFoundError) throw new UserEditError("Turn anchor does not belong to the selected parent Session.");
+    throw error;
+  }
+  const anchorTime = anchor.startedAt ? Date.parse(anchor.startedAt) : Number.NaN;
+  const childTime = child.createdAt ? Date.parse(child.createdAt) : Number.NaN;
+  if (Number.isFinite(anchorTime) && Number.isFinite(childTime) && anchorTime > childTime) {
+    throw new UserEditError("Turn anchor must not occur after the child Session was created.");
+  }
 }
 
 async function loadAllTurns(provider: LocalWebProvider, sessionId: string): Promise<readonly Turn[]> {
@@ -610,11 +656,13 @@ function projectSemanticParent(result: LocalWebSemanticParentResult) {
   const edge = result.edge ?? result.lookup.edge;
   const relation = edge?.userRelation ?? edge?.generatedRelation;
   const parentSessionId = edge?.userRelation ? edge.userParentSessionId : edge?.generatedParentSessionId;
+  const anchorTurnId = edge?.userRelation ? edge.userAnchorTurnId : undefined;
   return {
     availability: "available" as const,
     freshness: result.lookup.freshness,
     relation,
     parentSessionId,
+    anchorTurnId: anchorTurnId ?? null,
     authority: edge?.userRelation ? "user" : edge ? "ai" : undefined,
     generatedRelation: edge?.generatedRelation,
     generatedParentSessionId: edge?.generatedParentSessionId,
@@ -622,6 +670,7 @@ function projectSemanticParent(result: LocalWebSemanticParentResult) {
     generatedAt: edge?.generatedAt,
     userRelation: edge?.userRelation,
     userParentSessionId: edge?.userParentSessionId,
+    userAnchorTurnId: edge?.userAnchorTurnId,
     userReviewedAt: edge?.userReviewedAt,
     model: edge?.generator?.model,
     promptVersion: edge?.generator?.version,
@@ -638,10 +687,11 @@ function projectSemanticParent(result: LocalWebSemanticParentResult) {
 }
 
 async function inspectSemanticTrace(turn: Turn, semanticTraces: LocalWebSemanticTraces | undefined) {
-  if (!semanticTraces) return { availability: "unavailable" as const };
+  const fallbackLabel = turn.input?.text?.replace(/\s+/g, " ").trim().slice(0, 120) || `第 ${turn.displayOrdinal} 轮`;
+  if (!semanticTraces) return { availability: "unavailable" as const, navigationLabel: fallbackLabel };
   const lookup = await semanticTraces.inspect(turn);
   const feedback = await semanticTraces.getUserFeedback?.(turn);
-  const label = feedback?.editedText ?? lookup.trace?.text ?? (turn.input?.text?.replace(/\s+/g, " ").trim().slice(0, 120) || `第 ${turn.displayOrdinal} 轮`);
+  const label = feedback?.editedText ?? lookup.trace?.text ?? fallbackLabel;
   if (!lookup.trace) return { availability: "available" as const, freshness: lookup.freshness, displayText: feedback?.editedText, navigationLabel: label, userLabel: feedback?.editedText, userFeedback: feedback };
   return { ...projectSemanticTrace(lookup.freshness, lookup.trace, semanticTraces.inspectSafety?.(turn, lookup.trace), feedback, lookup.currentInputFingerprint), navigationLabel: label, userLabel: feedback?.editedText };
 }
@@ -659,7 +709,12 @@ function parseUserValue(field: UserField, input: unknown): UserValue | null {
     if (field === "title") return { title: normalizeSemanticSessionTitle(typeof value.title === "string" ? value.title : "") };
     if (field === "label") return { label: normalizeTraceText(typeof value.label === "string" ? value.label : "") };
     if (value.parentSessionId !== undefined && value.parentSessionId !== null && typeof value.parentSessionId !== "string") throw new Error("Parent Session ID must be a string.");
-    return { relation: parseSemanticParentRelation(value.relation), parentSessionId: typeof value.parentSessionId === "string" ? value.parentSessionId : undefined };
+    if (value.anchorTurnId !== undefined && value.anchorTurnId !== null && typeof value.anchorTurnId !== "string") throw new Error("Turn anchor ID must be a string.");
+    return {
+      relation: parseSemanticParentRelation(value.relation),
+      parentSessionId: typeof value.parentSessionId === "string" ? value.parentSessionId : undefined,
+      anchorTurnId: typeof value.anchorTurnId === "string" && value.anchorTurnId ? value.anchorTurnId : undefined,
+    };
   } catch (error) { throw new UserEditError((error as Error).message); }
 }
 

@@ -23,7 +23,7 @@ import {
   type SemanticTraceCompletionClient,
 } from "../../../packages/semantic-store/src/index.ts";
 import type { Session, Turn } from "../../../packages/core/src/index.ts";
-import { materializeSessionForest } from "../../../packages/forest/src/index.ts";
+import { materializeSessionForest, projectSessionBranches, type BranchTurn } from "../../../packages/forest/src/index.ts";
 import { organizeWorkspace } from "../../../packages/organizer/src/index.ts";
 import { createLocalWebServer, type LocalWebEnvironment, type LocalWebForest, type LocalWebOrganizer, type LocalWebSemanticParents, type LocalWebSemanticTitles, type LocalWebSemanticTraces } from "./server.ts";
 
@@ -227,6 +227,7 @@ async function createSemanticPreview(values: readonly string[]): Promise<{ store
             providerId: session.providerId,
             childSessionId: session.providerSessionId,
             parentSessionId: review.parentSessionId,
+            anchorTurnId: review.anchorTurnId,
             relation: review.relation,
             sessions: context.sessions,
           });
@@ -283,36 +284,46 @@ async function createForestProjection(values: readonly string[]): Promise<{ fore
       } while (cursor);
       return sessions;
     };
-    const countTurns = async (sessionId: string): Promise<number> => {
-      let count = 0;
+    const turnDirectory = async (providerId: string, sessionId: string): Promise<BranchTurn[]> => {
+      const turns: Turn[] = [];
       let cursor: string | undefined;
       const seen = new Set<string>();
       do {
         const page = await adapter.listTurns(sessionId, cursor);
-        count += page.data.length;
+        turns.push(...page.data);
         if (!page.nextCursor || seen.has(page.nextCursor)) break;
         seen.add(page.nextCursor);
         cursor = page.nextCursor;
       } while (cursor);
-      return count;
+      const traces = new Map((await store.listSession(providerId, sessionId)).map((trace) => [trace.nativeTurnId, trace.text]));
+      const labels = new Map(store.overrides.list(providerId, "label", sessionId).flatMap((item) => item.value?.label && item.nativeTurnId ? [[item.nativeTurnId, item.value.label] as const] : []));
+      return turns.map((turn) => ({
+        nativeTurnId: turn.nativeTurnId,
+        displayOrdinal: turn.displayOrdinal,
+        displayLabel: labels.get(turn.nativeTurnId) ?? traces.get(turn.nativeTurnId) ?? (turn.input?.text?.replace(/\s+/g, " ").trim().slice(0, 120) || `第 ${turn.displayOrdinal} 轮`),
+      }));
     };
     return {
       forest: {
         materialize: async (scopeId) => {
           const sessions = (await listAllSessions(scopeId)).filter((session) => !session.excludedFromMainWorkspaceForest);
           const inputs = await Promise.all(sessions.map(async (session) => {
-            const [semanticTitle, semanticParent, nativeLineage, traces, turnCount] = await Promise.all([
+            const [semanticTitle, semanticParent, nativeLineage, traces, turns] = await Promise.all([
               store.getSessionTitle(session.providerId, session.providerSessionId),
               store.getSemanticParent(session.providerId, session.providerSessionId),
               adapter.getNativeLineage(session.providerSessionId),
               store.listSession(session.providerId, session.providerSessionId),
-              countTurns(session.providerSessionId),
+              turnDirectory(session.providerId, session.providerSessionId),
             ]);
             const labelled = store.overrides.list(session.providerId, "label", session.providerSessionId).filter((item) => item.value?.label);
             const traceCount = new Set([...traces.map((trace) => trace.nativeTurnId), ...labelled.map((item) => item.nativeTurnId)]).size;
-            return { session, semanticTitle, semanticParent, nativeLineage, turnCount, traceCount };
+            return { session, semanticTitle, semanticParent, nativeLineage, turns, turnCount: turns.length, traceCount };
           }));
-          return materializeSessionForest(scopeId, inputs);
+          const forestInputs = inputs.map(({ turns: _turns, ...input }) => input);
+          return {
+            ...materializeSessionForest(scopeId, forestInputs),
+            branches: projectSessionBranches(forestInputs, new Map(inputs.map((input) => [input.session.providerSessionId, input.turns]))),
+          };
         },
       },
       databasePath,

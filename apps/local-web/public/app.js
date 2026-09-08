@@ -624,6 +624,7 @@ async function loadAllForestTurns(sessionId) {
 function renderForestTraces(sessionId) {
   const container = create("div", "forest-traces");
   const cached = state.forestTurnCache.get(sessionId);
+  const branch = state.forest?.branches?.find((item) => item.sessionId === sessionId);
   if (!cached || cached.loading) {
     container.append(create("p", "forest-trace-missing", {}, "Loading Turn traces…"));
     return container;
@@ -654,10 +655,30 @@ function renderForestTraces(sessionId) {
   container.append(...cached.turns.map((turn) => {
     const item = create("button", "forest-trace-item", { type: "button" });
     item.append(create("span", "forest-trace-ordinal", {}, `T${turn.ordinal}`));
-    item.append(create("span", "forest-trace-text", {}, turn.semanticTrace?.navigationLabel ?? turn.semanticTrace?.displayText ?? (turn.input?.replace(/\s+/g, " ").trim().slice(0, 120) || `第 ${turn.ordinal} 轮`)));
+    const content = create("span", "forest-trace-content");
+    content.append(create("span", "forest-trace-text", {}, turn.semanticTrace?.navigationLabel ?? turn.semanticTrace?.displayText ?? (turn.input?.replace(/\s+/g, " ").trim().slice(0, 120) || `第 ${turn.ordinal} 轮`)));
+    const attachments = branch?.turns?.find((item) => item.nativeTurnId === turn.id)?.childSessions ?? [];
+    if (attachments.length) {
+      const children = create("span", "forest-turn-branches");
+      for (const child of attachments) {
+        const provenance = child.source === "native" ? "Native fork" : `${child.source === "user" ? "User" : "AI"} · ${child.relation}`;
+        children.append(create("span", "forest-turn-branch", {}, `↳ ${child.childTitle} · ${provenance}`));
+      }
+      content.append(children);
+    }
+    item.append(content);
     item.addEventListener("click", () => void selectForestSession(sessionId, turn.id));
     return item;
   }));
+  if (branch?.sessionLevelChildren?.length) {
+    const children = create("div", "forest-session-branches");
+    children.append(create("span", "forest-trace-ordinal", {}, "SESSION"));
+    children.append(create("span", "forest-trace-text", {}, branch.sessionLevelChildren.map((child) => `↳ ${child.childTitle} · ${child.source === "user" ? "User" : "AI"} · ${child.relation}`).join("\n")));
+    container.append(children);
+  }
+  for (const child of branch?.unavailableAnchors ?? []) {
+    container.append(create("p", "forest-anchor-unavailable", {}, `Turn anchor unavailable · ${child.childTitle} (${child.anchorTurnId})`));
+  }
   return container;
 }
 
@@ -940,7 +961,7 @@ function renderSemanticParent(session) {
   if (parent.generatedReason) panel.append(create("p", "semantic-parent-reason", {}, `AI reason: ${parent.generatedReason}`));
   if (parent.nativeLineage) {
     const native = parent.nativeLineage.parentSessionId
-      ? `${parent.nativeLineage.parentSessionId} · ${parent.nativeLineage.kind} · ${parent.nativeLineage.recovery}`
+      ? `${parent.nativeLineage.parentSessionId}${parent.nativeLineage.originTurnId ? ` / ${parent.nativeLineage.originTurnId}` : ""} · ${parent.nativeLineage.kind} · ${parent.nativeLineage.recovery}`
       : `${parent.nativeLineage.kind} · ${parent.nativeLineage.recovery}`;
     panel.append(create("p", "semantic-parent-native", {}, `Native lineage (separate): ${native}`));
   }
@@ -951,7 +972,8 @@ function semanticParentLabel(parent) {
   if (!parent.relation) return "Not inferred yet.";
   if (parent.relation === "root") return `ROOT · ${parent.authority === "user" ? "User selected" : "AI inferred"}`;
   const candidate = parent.candidates?.find((item) => item.sessionId === parent.parentSessionId);
-  return `${candidate?.title ?? parent.parentSessionId} · ${parent.relation} · ${parent.authority === "user" ? "User selected" : "AI inferred"}`;
+  const anchor = parent.anchorTurnId ? ` · anchor ${parent.anchorTurnId}` : " · Session level";
+  return `${candidate?.title ?? parent.parentSessionId}${anchor} · ${parent.relation} · ${parent.authority === "user" ? "User selected" : "AI inferred"}`;
 }
 
 async function inferSemanticParent(session, button) {
@@ -980,6 +1002,7 @@ async function showSemanticParentEditor(session, parent = {}, panel) {
   const editor = create("div", "semantic-parent-editor");
   const search = create("input", "semantic-title-input", { type: "search", placeholder: "Filter legal parent titles…", "aria-label": "Filter legal parent titles" });
   const select = create("select", "semantic-parent-select", { "aria-label": "Semantic Parent Session" });
+  const anchor = create("select", "semantic-parent-select", { "aria-label": "Optional anchor Turn" });
   const suggested = new Set((parent.candidates ?? []).map((candidate) => candidate.sessionId));
   candidates.sort((a, b) => Number(suggested.has(b.sessionId)) - Number(suggested.has(a.sessionId)));
   const populate = () => {
@@ -999,18 +1022,59 @@ async function showSemanticParentEditor(session, parent = {}, panel) {
   }
   const save = create("button", "button primary", { type: "button" }, "Save relationship");
   const cancel = create("button", "button secondary", { type: "button" }, "Cancel");
+  let anchorLoad = 0;
+  const populateAnchors = async (parentSessionId, selectedAnchorId) => {
+    const load = ++anchorLoad;
+    anchor.disabled = true;
+    anchor.replaceChildren(create("option", "", { value: "" }, parentSessionId ? "Loading Turns…" : "No Turn anchor (Session level)"));
+    if (!parentSessionId) return;
+    try {
+      const turns = await loadTurnDirectory(parentSessionId);
+      if (load !== anchorLoad) return;
+      anchor.replaceChildren(create("option", "", { value: "" }, "No Turn anchor (Session level)"));
+      for (const turn of turns) {
+        const option = create("option", "", { value: turn.nativeTurnId }, `T${turn.displayOrdinal}  ${turn.displayLabel}`);
+        if (turn.nativeTurnId === selectedAnchorId) option.selected = true;
+        anchor.append(option);
+      }
+      if (selectedAnchorId && !turns.some((turn) => turn.nativeTurnId === selectedAnchorId)) {
+        anchor.append(create("option", "", { value: selectedAnchorId, selected: "" }, `Turn anchor unavailable · ${selectedAnchorId}`));
+      }
+      anchor.disabled = false;
+    } catch (error) {
+      if (load !== anchorLoad) return;
+      anchor.replaceChildren(create("option", "", { value: "" }, error.message));
+    }
+  };
   save.disabled = !select.value;
-  search.addEventListener("input", () => { populate(); save.disabled = !select.value; });
-  save.addEventListener("click", () => void reviewSemanticParent(session, relation.value, select.value, override.revision));
+  search.addEventListener("input", () => { populate(); save.disabled = !select.value; void populateAnchors(select.value); });
+  select.addEventListener("change", () => { save.disabled = !select.value; void populateAnchors(select.value); });
+  save.addEventListener("click", () => void reviewSemanticParent(session, relation.value, select.value, override.revision, anchor.value || undefined));
   cancel.addEventListener("click", () => renderSemanticParent(session));
-  editor.append(search, select, relation, save, cancel);
+  editor.append(search, select, anchor, relation, save, cancel);
   panel.append(editor);
+  await populateAnchors(select.value, parent.anchorTurnId ?? override.value?.anchorTurnId);
 }
 
-async function reviewSemanticParent(session, relation, parentSessionId, revision) {
+async function loadTurnDirectory(sessionId) {
+  const turns = [];
+  let cursor;
+  const seen = new Set();
+  do {
+    const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
+    const page = await api(`/api/sessions/${encodeURIComponent(sessionId)}/turn-directory${query}`);
+    turns.push(...page.data);
+    if (!page.nextCursor || seen.has(page.nextCursor)) break;
+    seen.add(page.nextCursor);
+    cursor = page.nextCursor;
+  } while (cursor);
+  return turns;
+}
+
+async function reviewSemanticParent(session, relation, parentSessionId, revision, anchorTurnId) {
   try {
     revision ??= (await readManualOverride(session, "parent")).override.revision;
-    const result = await writeManualOverride(session, "parent", { relation, parentSessionId }, revision);
+    const result = await writeManualOverride(session, "parent", { relation, parentSessionId, anchorTurnId }, revision);
     applySemanticParentToSession(session.providerSessionId, result.semanticParent);
     await loadForest(true);
     renderTranscript();

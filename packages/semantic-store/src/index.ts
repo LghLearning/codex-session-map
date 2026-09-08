@@ -247,7 +247,7 @@ export class SqliteSemanticTraceStore implements SemanticTraceStore {
     `).get(providerId, childSessionId) as SemanticParentRow | undefined;
     const override = this.overrides.read({ providerId, sessionId: childSessionId, field: "parent" });
     if (!row && !override?.value?.relation) return undefined;
-    return { ...(row ? projectSemanticParentRow(row) : { providerId, childSessionId }), userRelation: override?.value?.relation, userParentSessionId: override?.value?.parentSessionId, userReviewedAt: override?.value ? override.updatedAt : undefined };
+    return { ...(row ? projectSemanticParentRow(row) : { providerId, childSessionId }), userRelation: override?.value?.relation, userParentSessionId: override?.value?.parentSessionId, userAnchorTurnId: override?.value?.anchorTurnId, userReviewedAt: override?.value ? override.updatedAt : undefined };
   }
 
   async listSemanticParents(providerId: string): Promise<readonly SemanticParentEdge[]> {
@@ -299,8 +299,9 @@ export class SqliteSemanticTraceStore implements SemanticTraceStore {
     parentSessionId: string | undefined,
     relation: SemanticParentRelation,
     reviewedAt: string,
+    anchorTurnId?: string,
   ): Promise<void> {
-    this.overrides.write({ providerId, sessionId: childSessionId, field: "parent" }, "", { relation, parentSessionId });
+    this.overrides.write({ providerId, sessionId: childSessionId, field: "parent" }, "", { relation, parentSessionId, anchorTurnId });
   }
 
   async close(): Promise<void> {

@@ -12,6 +12,7 @@ export interface ForestSemanticParentInput {
   readonly generatedRelation?: ForestSemanticRelation;
   readonly userParentSessionId?: string;
   readonly userRelation?: ForestSemanticRelation;
+  readonly userAnchorTurnId?: string;
 }
 
 export interface ForestSessionInput {
@@ -36,6 +37,7 @@ export interface SessionForestNode {
   readonly semanticParentSessionId?: string;
   readonly semanticRelation: ForestSemanticRelation;
   readonly placementSource: "user" | "ai" | "none";
+  readonly semanticAnchorTurnId?: string;
   readonly nativeLineage?: NativeLineage | null;
   readonly children: readonly SessionForestNode[];
 }
@@ -62,6 +64,8 @@ export interface SessionForest {
   readonly unorganized: readonly SessionForestNode[];
   readonly stats: SessionForestStats;
   readonly issues: readonly SessionForestIssue[];
+  /** Optional Turn-chain branch projection for consumers that load a lightweight Turn directory. */
+  readonly branches?: readonly SessionBranchProjection[];
 }
 
 interface MutableNode extends Omit<SessionForestNode, "children"> {
@@ -90,6 +94,7 @@ export function materializeSessionForest(workspaceScopeId: string, inputs: reado
       semanticParentSessionId: placement.parentSessionId,
       semanticRelation: placement.relation,
       placementSource: placement.source,
+      semanticAnchorTurnId: placement.anchorTurnId,
       nativeLineage: input.nativeLineage,
       children: [],
     });
@@ -140,12 +145,14 @@ export function materializeSessionForest(workspaceScopeId: string, inputs: reado
 
 function preferredPlacement(edge: ForestSemanticParentInput | undefined): {
   parentSessionId?: string;
+  anchorTurnId?: string;
   relation: ForestSemanticRelation;
   source: "user" | "ai" | "none";
 } {
   if (!edge) return { relation: "root", source: "none" };
   if (edge.userRelation) return {
     parentSessionId: edge.userRelation === "root" ? undefined : edge.userParentSessionId,
+    anchorTurnId: edge.userRelation === "root" ? undefined : edge.userAnchorTurnId,
     relation: edge.userRelation,
     source: "user",
   };
@@ -154,6 +161,70 @@ function preferredPlacement(edge: ForestSemanticParentInput | undefined): {
     relation: edge.generatedRelation ?? "root",
     source: edge.generatedRelation ? "ai" : "none",
   };
+}
+
+export interface BranchTurn {
+  readonly nativeTurnId: string;
+  readonly displayOrdinal: number;
+  readonly displayLabel: string;
+}
+
+export interface BranchAttachment {
+  readonly childSessionId: string;
+  readonly childTitle: string;
+  readonly relation: ForestSemanticRelation | "native";
+  readonly source: "user" | "ai" | "native";
+  readonly anchorTurnId: string;
+  readonly anchorAvailability: "available" | "unavailable";
+}
+
+export interface SessionBranchProjection {
+  readonly sessionId: string;
+  readonly turns: readonly (BranchTurn & { readonly childSessions: readonly BranchAttachment[] })[];
+  readonly sessionLevelChildren: readonly Omit<BranchAttachment, "anchorTurnId" | "anchorAvailability">[];
+  readonly unavailableAnchors: readonly BranchAttachment[];
+}
+
+/** Builds a display projection only. Turn order and identities come exclusively from the provider directory. */
+export function projectSessionBranches(
+  inputs: readonly ForestSessionInput[],
+  turnsBySession: ReadonlyMap<string, readonly BranchTurn[]>,
+): readonly SessionBranchProjection[] {
+  const sessions = new Map(inputs.map((input) => [input.session.providerSessionId, input]));
+  const anchored = new Map<string, BranchAttachment[]>();
+  const sessionLevel = new Map<string, Omit<BranchAttachment, "anchorTurnId" | "anchorAvailability">[]>();
+  const attach = (parentId: string, value: BranchAttachment) => anchored.set(parentId, [...anchored.get(parentId) ?? [], value]);
+  for (const input of inputs) {
+    const placement = preferredPlacement(input.semanticParent);
+    const title = input.semanticTitle?.userTitle ?? input.semanticTitle?.generatedTitle ?? input.session.title;
+    if (placement.relation !== "root" && placement.parentSessionId && sessions.has(placement.parentSessionId)) {
+      if (placement.anchorTurnId) attach(placement.parentSessionId, {
+        childSessionId: input.session.providerSessionId, childTitle: title, relation: placement.relation,
+        source: placement.source === "none" ? "ai" : placement.source, anchorTurnId: placement.anchorTurnId,
+        anchorAvailability: turnsBySession.get(placement.parentSessionId)?.some((turn) => turn.nativeTurnId === placement.anchorTurnId) ? "available" : "unavailable",
+      });
+      else sessionLevel.set(placement.parentSessionId, [...sessionLevel.get(placement.parentSessionId) ?? [], {
+        childSessionId: input.session.providerSessionId, childTitle: title, relation: placement.relation, source: placement.source === "none" ? "ai" : placement.source,
+      }]);
+    }
+    const native = input.nativeLineage;
+    if (native?.parentSessionId && native.originTurnId && native.recovery === "exact" && sessions.has(native.parentSessionId)) attach(native.parentSessionId, {
+      childSessionId: input.session.providerSessionId, childTitle: title, relation: "native", source: "native",
+      anchorTurnId: native.originTurnId,
+      anchorAvailability: turnsBySession.get(native.parentSessionId)?.some((turn) => turn.nativeTurnId === native.originTurnId) ? "available" : "unavailable",
+    });
+  }
+  return inputs.map((input) => {
+    const sessionId = input.session.providerSessionId;
+    const turns = turnsBySession.get(sessionId) ?? [];
+    const attachments = anchored.get(sessionId) ?? [];
+    return {
+      sessionId,
+      turns: turns.map((turn) => ({ ...turn, childSessions: attachments.filter((child) => child.anchorTurnId === turn.nativeTurnId && child.anchorAvailability === "available") })),
+      sessionLevelChildren: sessionLevel.get(sessionId) ?? [],
+      unavailableAnchors: attachments.filter((child) => child.anchorAvailability === "unavailable"),
+    };
+  });
 }
 
 function breakCycles(parentByChild: Map<string, string>, nodes: Map<string, MutableNode>, issues: SessionForestIssue[]): void {
@@ -190,6 +261,7 @@ function findCycle(parentByChild: Map<string, string>): readonly string[] {
 
 function rootNode(node: MutableNode): void {
   delete (node as { semanticParentSessionId?: string }).semanticParentSessionId;
+  delete (node as { semanticAnchorTurnId?: string }).semanticAnchorTurnId;
   (node as { semanticRelation: ForestSemanticRelation }).semanticRelation = "root";
   (node as { placementSource: "user" | "ai" | "none" }).placementSource = "none";
 }

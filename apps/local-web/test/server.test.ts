@@ -4,6 +4,7 @@ import test from "node:test";
 import type { NativeLineage, Page, SemanticTraceLookup, Session, SessionProviderCapabilities, SessionProviderUpdate, Turn, TurnSemanticTrace, WorkspaceScope } from "../../../packages/core/src/index.ts";
 import { createLocalWebServer, type LocalWebProvider, type LocalWebSemanticParentResult, type LocalWebSemanticParents, type LocalWebSemanticTitleRecord, type LocalWebSemanticTitles, type LocalWebSemanticTraces } from "../src/server.ts";
 import { materializeSessionForest } from "../../../packages/forest/src/index.ts";
+import { SqliteSemanticTraceStore } from "../../../packages/semantic-store/src/index.ts";
 import type { WorkspaceOrganizationProgress, WorkspaceOrganizationResult } from "../../../packages/organizer/src/index.ts";
 
 const scope: WorkspaceScope = {
@@ -75,6 +76,33 @@ test("single-Turn API retains paginated lookup for providers without readTurn", 
   assert.equal(((await response.json()) as { turn: { id: string } }).turn.id, target.nativeTurnId);
   assert.deepEqual(cursors, [undefined, "opaque-next"]);
   assert.equal((await fetch(`${running.url}/api/sessions/visible-a/turns/missing`)).status, 404);
+});
+
+test("Turn directory is lightweight and anchored manual placement validates native Turn membership", async (t) => {
+  const provider = new FakeProvider();
+  const store = new SqliteSemanticTraceStore();
+  const running = await createLocalWebServer({ provider, userOverrides: store, port: 0 }).start();
+  t.after(async () => { await running.close(); await store.close(); });
+  const directory = await json(`${running.url}/api/sessions/visible-a/turn-directory`);
+  assert.deepEqual(directory.data, [{ nativeTurnId: "native-turn-a", displayOrdinal: 1, displayLabel: "Fixture input" }]);
+  assert.equal("input" in directory.data[0], false);
+  assert.equal("assistantFinal" in directory.data[0], false);
+  const write = async (value: unknown, revision: number, expected = 200) => {
+    const response = await fetch(`${running.url}/api/sessions/visible-b/user-overrides/parent`, {
+      method: "POST", headers: { Origin: running.url, "Content-Type": "application/json" }, body: JSON.stringify({ value, revision }),
+    });
+    assert.equal(response.status, expected, JSON.stringify(await response.clone().json()));
+    return response.json() as Promise<any>;
+  };
+  const anchored = await write({ relation: "subtask", parentSessionId: "visible-a", anchorTurnId: "native-turn-a" }, 0);
+  assert.equal(anchored.semanticParent.anchorTurnId, "native-turn-a");
+  assert.equal(anchored.override.value.anchorTurnId, "native-turn-a");
+  await write({ relation: "subtask", parentSessionId: "visible-a", anchorTurnId: "foreign-turn" }, 1, 400);
+  const sessionLevel = await write({ relation: "continuation", parentSessionId: "visible-a" }, 1);
+  assert.equal(sessionLevel.semanticParent.anchorTurnId, null, "changing placement without an anchor clears the old anchor atomically");
+  const root = await write({ relation: "root" }, 2);
+  assert.equal(root.semanticParent.parentSessionId, undefined);
+  assert.equal(root.semanticParent.anchorTurnId, null);
 });
 
 test("local web API is loopback-only, paginated, read-only, and provider-neutral", async (t) => {
@@ -416,9 +444,9 @@ class FakeSemanticParents implements LocalWebSemanticParents {
     };
     return { ...(await this.inspect()), edge: this.edge };
   }
-  async review(_session: Session, review: { parentSessionId?: string; relation: "continuation" | "subtask" | "root" }): Promise<LocalWebSemanticParentResult> {
+  async review(_session: Session, review: { parentSessionId?: string; anchorTurnId?: string; relation: "continuation" | "subtask" | "root" }): Promise<LocalWebSemanticParentResult> {
     if (!this.edge) throw new Error("missing edge");
-    this.edge = { ...this.edge, userParentSessionId: review.parentSessionId, userRelation: review.relation, userReviewedAt: "2026-09-01T00:01:00.000Z" };
+    this.edge = { ...this.edge, userParentSessionId: review.parentSessionId, userAnchorTurnId: review.anchorTurnId, userRelation: review.relation, userReviewedAt: "2026-09-01T00:01:00.000Z" };
     return { ...(await this.inspect()), edge: this.edge };
   }
 }
@@ -454,6 +482,7 @@ function session(id: string, hidden: boolean): Session {
     providerSessionId: id,
     workspaceScopeId: scope.id,
     title: id,
+    createdAt: id === "visible-a" ? "2026-01-01T00:00:00.000Z" : "2026-01-02T00:00:00.000Z",
     archiveStatus: "active",
     sourceKind: hidden ? "agent" : "interactive",
     excludedFromMainWorkspaceForest: hidden,

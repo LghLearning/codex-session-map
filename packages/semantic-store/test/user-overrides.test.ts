@@ -75,6 +75,37 @@ test("revision conflicts across database connections block stale edits and stale
   await first.close(); await second.close();
 });
 
+test("anchored Semantic Placement is atomic, persistent, undoable, and independent from Turn labels", async () => {
+  const path = join(await mkdtemp(join(tmpdir(), "map-b5-anchor-")), "store.sqlite");
+  const values = [session("a"), session("b", "2026-02-01T00:00:00Z"), session("c")];
+  let store = new SqliteSemanticTraceStore(path);
+  const parentKey = key("parent");
+  const first = store.overrides.write(parentKey, "workspace", { relation: "subtask", parentSessionId: "a", anchorTurnId: "a/native-3" }, 0, values);
+  assert.deepEqual((await store.getSemanticParent("fixture", "b")) && preferredSemanticParent((await store.getSemanticParent("fixture", "b"))!), {
+    parentSessionId: "a", anchorTurnId: "a/native-3", relation: "subtask", authority: "user",
+  });
+  await store.close();
+  store = new SqliteSemanticTraceStore(path);
+  const parents = new SemanticParentService({ store, generator: { identity, generate: async () => ({ relation: "continuation", parentSessionId: "a", reason: "AI changed" }) } });
+  await parents.generate(parentSource, values);
+  assert.equal(preferredSemanticParent((await store.getSemanticParent("fixture", "b"))!).anchorTurnId, "a/native-3", "AI regeneration preserves the user anchor");
+  const traces = new TurnSemanticTraceService({ store, generator: { identity, generate: async () => ({ text: "AI trace changed" }) } });
+  await traces.regenerate(turn);
+  assert.equal(store.overrides.read(parentKey)?.value?.anchorTurnId, "a/native-3", "Trace regeneration cannot change topology");
+  const move = store.overrides.write(parentKey, "workspace", { relation: "continuation", parentSessionId: "c", anchorTurnId: "c/native-7" }, first.revision, values);
+  assert.deepEqual(store.overrides.read(parentKey)?.value, { relation: "continuation", parentSessionId: "c", anchorTurnId: "c/native-7" });
+  store.overrides.write(key("label"), "workspace", { label: "Changed navigation text" }, 0, values);
+  assert.equal(store.overrides.read(parentKey)?.value?.anchorTurnId, "c/native-7");
+  store.overrides.undo(move.id, move.revision, "workspace", values);
+  assert.deepEqual(store.overrides.read(parentKey)?.value, { relation: "subtask", parentSessionId: "a", anchorTurnId: "a/native-3" });
+  assert.throws(() => store.overrides.write(parentKey, "workspace", { relation: "root", anchorTurnId: "a/native-3" }, 3, values), /root.*anchor/i);
+  const rooted = store.overrides.write(parentKey, "workspace", { relation: "root" }, 3, values);
+  assert.deepEqual(store.overrides.read(parentKey)?.value, { relation: "root" });
+  store.overrides.undo(rooted.id, rooted.revision, "workspace", values);
+  assert.equal(store.overrides.read(parentKey)?.value?.anchorTurnId, "a/native-3");
+  await store.close();
+});
+
 test("manual parents cover more than AI Top-K, while future, self, workspace and cycle checks remain enforced", async () => {
   const store = new SqliteSemanticTraceStore();
   const values = [...Array.from({ length: 12 }, (_, i) => session(`parent-${i}`)), session("b", "2026-02-01T00:00:00Z"), session("future", "2026-03-01T00:00:00Z"), { ...session("other"), workspaceScopeId: "other" }];
@@ -160,7 +191,7 @@ test("real --no-semantic-traces server persists manual organization across resta
   const home = join(root, "codex"), storePath = join(root, "semantic.sqlite");
   await mkdir(join(home, "sessions"), { recursive: true });
   const files: [string, string][] = [];
-  for (const id of ["a", "b", "c"]) {
+  for (const id of ["a", "b", "c", "d"]) {
     const records = [
       { type: "session_meta", payload: { id, cwd: root, timestamp: "2026-01-01T00:00:00Z", source: "cli" } },
       { type: "event_msg", payload: { type: "task_started", turn_id: "native/1" } },
@@ -195,19 +226,26 @@ test("real --no-semantic-traces server persists manual organization across resta
   const workspace = bootstrap.scopes[0].id;
   const title = await request("/api/sessions/b/user-overrides/title", { value: { title: "Offline rename" }, revision: 0 });
   await request("/api/sessions/b/user-overrides/label?turnId=native%2F1", { value: { label: "Offline label" }, revision: 0 });
-  await request("/api/sessions/b/user-overrides/parent", { value: { relation: "continuation", parentSessionId: "a" }, revision: 0 });
-  const rootEdit = await request("/api/sessions/c/user-overrides/parent", { value: { relation: "root" }, revision: 0 });
+  await request("/api/sessions/b/user-overrides/parent", { value: { relation: "subtask", parentSessionId: "a", anchorTurnId: "native/1" }, revision: 0 });
+  await request("/api/sessions/c/user-overrides/parent", { value: { relation: "continuation", parentSessionId: "a" }, revision: 0 });
+  const rootEdit = await request("/api/sessions/d/user-overrides/parent", { value: { relation: "root" }, revision: 0 });
   await request("/api/sessions/b/semantic-title", {}, 503);
   await request("/api/sessions/b/user-overrides/title", { value: { title: "Stale edit" }, revision: 0 }, 409);
   await running.stop(); running = await start();
   assert.equal((await request("/api/sessions/b/user-overrides/title")).semanticTitle.displayTitle, "Offline rename");
   assert.equal((await request("/api/sessions/b/turns/native%2F1")).turn.semanticTrace.displayText, "Offline label");
-  assert.equal((await request("/api/sessions/b/user-overrides/parent")).semanticParent.parentSessionId, "a");
-  assert.equal((await request("/api/sessions/c/user-overrides/parent")).semanticParent.authority, "user");
+  const anchoredParent = (await request("/api/sessions/b/user-overrides/parent")).semanticParent;
+  assert.equal(anchoredParent.parentSessionId, "a");
+  assert.equal(anchoredParent.anchorTurnId, "native/1");
+  assert.equal((await request("/api/sessions/c/user-overrides/parent")).semanticParent.anchorTurnId, null);
+  assert.equal((await request("/api/sessions/d/user-overrides/parent")).semanticParent.authority, "user");
   const forest = (await request(`/api/scopes/${encodeURIComponent(workspace)}/forest`)).forest;
-  assert.equal(forest.roots.find((node: any) => node.sessionId === "c").placementSource, "user");
+  assert.equal(forest.roots.find((node: any) => node.sessionId === "d").placementSource, "user");
+  const parentBranches = forest.branches.find((item: any) => item.sessionId === "a");
+  assert.deepEqual(parentBranches.turns[0].childSessions.map((item: any) => item.childSessionId), ["b"]);
+  assert.deepEqual(parentBranches.sessionLevelChildren.map((item: any) => item.childSessionId), ["c"]);
   await request(`/api/user-edits/${rootEdit.edit.id}/undo`, { revision: 1 });
-  assert.equal((await request("/api/sessions/c/user-overrides/parent")).semanticParent.relation, undefined);
+  assert.equal((await request("/api/sessions/d/user-overrides/parent")).semanticParent.relation, undefined);
   await request(`/api/user-edits/${title.edit.id}/undo`, { revision: 1 });
   assert.equal((await request("/api/sessions/b/user-overrides/title")).semanticTitle.displayTitle, "Original b");
   await running.stop();
