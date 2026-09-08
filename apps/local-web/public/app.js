@@ -52,7 +52,7 @@ const elements = Object.fromEntries([
   "forest-zoom-out", "forest-fit", "forest-zoom-in", "organize-workspace", "cancel-organize", "organize-progress",
   "environment-version", "environment-history", "environment-store", "environment-ollama", "environment-model",
   "turn-window-controls", "previous-turn-window", "turn-window-status", "next-turn-window",
-  "refresh-button", "diagnostics-button", "diagnostics-dialog", "close-diagnostics",
+  "refresh-button", "map-v2-link", "diagnostics-button", "diagnostics-dialog", "close-diagnostics",
   "diagnostic-environment", "diagnostic-counts", "diagnostic-list", "toast",
 ].map((id) => [id, document.getElementById(id)]));
 
@@ -272,6 +272,11 @@ function applyNavigationSnapshot(snapshot, historyMode, preserveScroll) {
   state.sessionCursor = snapshot.sessionCursor;
   state.selectedSession = snapshot.selectedSession;
   state.selectedTurnId = snapshot.target.turnId;
+  const mapUrl = new URL("/map-v2", window.location.origin);
+  if (snapshot.target.scopeId) mapUrl.searchParams.set("workspace", snapshot.target.scopeId);
+  if (snapshot.target.sessionId) mapUrl.searchParams.set("session", snapshot.target.sessionId);
+  if (snapshot.target.turnId) mapUrl.searchParams.set("turn", snapshot.target.turnId);
+  elements["map-v2-link"].href = `${mapUrl.pathname}${mapUrl.search}`;
   state.turns = snapshot.turns;
   state.turnCursor = snapshot.turnCursor;
   if (previousScopeId !== snapshot.target.scopeId) {

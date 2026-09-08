@@ -17,6 +17,11 @@ $nodeExecutable = if ($nodeCommand.Source) { $nodeCommand.Source } else { $nodeC
 & $nodeExecutable (Join-Path $projectRoot "scripts\check-node-version.mjs")
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+$pnpmCommand = Get-Command pnpm -ErrorAction SilentlyContinue
+if (-not $pnpmCommand) { throw "Codex Session Map requires pnpm to build the Map Workspace." }
+& $pnpmCommand.Source --dir $projectRoot build:map
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
 $serverArguments = @("apps/local-web/src/main.ts", "--port", [string]$Port)
 if ($Fallback) { $serverArguments += "--no-app-server" }
 $server = Start-Process -FilePath $nodeExecutable -ArgumentList $serverArguments -WorkingDirectory $projectRoot -WindowStyle Hidden -PassThru

@@ -9,7 +9,7 @@ WorkspaceScope
       -> native Turn transcript / Semantic Trace
 ```
 
-Run it with `pnpm start` or force structured/rollout fallback with `pnpm start:fallback`. It binds to loopback, never serves Codex mutation routes, and shows diagnostics instead of silently dropping partial records.
+Run it with `pnpm start` or force structured/rollout fallback with `pnpm start:fallback`. The start command builds and serves the React Map Workspace at `/`; the previous Explorer remains available at `/legacy`. It binds to loopback, never serves Codex mutation routes, and shows diagnostics instead of silently dropping partial records.
 
 If local Ollama/qwen3.5 is available, explicit actions can generate missing/stale Traces for the current Session, a Semantic Session Title, or a Semantic Parent suggestion. These write only to the app-owned semantic store and never write Codex data.
 

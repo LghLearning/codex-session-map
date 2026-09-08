@@ -83,13 +83,13 @@ pnpm start
 pnpm start:fallback
 ```
 
-The default URL is `http://127.0.0.1:4319`.
+The default URL is `http://127.0.0.1:4319`. It opens the React Map Workspace; the previous Explorer remains available at `/legacy` during the migration.
 
 ## Organize a Workspace
 
 1. Select a Workspace.
-2. Open **Forest**.
-3. Click **Organize Workspace**.
+2. Open the Map Workspace, or use the legacy **Forest** view.
+3. Click **Organize** / **Organize Workspace**.
 4. Review the generated titles and relationships.
 5. Use **Rename**, **Edit label**, **Change parent**, or **Set root** to organize directly, even without AI results. **Restore automatic** clears your override; **Undo** reverses your recent manual change.
 

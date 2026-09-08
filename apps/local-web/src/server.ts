@@ -795,9 +795,9 @@ function requireSemanticTitle(value: unknown): string {
 }
 
 async function serveStatic(publicDirectory: string, request: IncomingMessage, response: ServerResponse, pathname: string): Promise<void> {
-  const relative = pathname === "/map-v2" || pathname === "/map-v2/"
+  const relative = pathname === "/" || pathname === "/map-v2" || pathname === "/map-v2/"
     ? "map-v2/index.html"
-    : pathname === "/legacy" || pathname === "/" || isNavigationPath(pathname) ? "index.html" : pathname.slice(1);
+    : pathname === "/legacy" || isNavigationPath(pathname) ? "index.html" : pathname.slice(1);
   if (!/^[A-Za-z0-9._/-]+$/.test(relative) || relative.includes("..")) return sendProblem(response, 404, "not_found", "Asset not found.");
   const path = resolve(publicDirectory, relative);
   if (!path.startsWith(`${resolve(publicDirectory)}${sep}`)) return sendProblem(response, 404, "not_found", "Asset not found.");

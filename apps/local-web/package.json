@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node src/main.ts",
+    "start": "pnpm build:map && node src/main.ts",
     "build:map": "vite build --config vite.map.config.ts",
     "typecheck:map": "tsc -p map-v2/tsconfig.json --noEmit"
   },
