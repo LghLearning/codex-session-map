@@ -16,6 +16,9 @@ export interface MapGraphOptions {
   selection?: Selection;
   positions?: Readonly<Record<string, XYPosition>>;
   showNative?: boolean;
+  turnStates?: ReadonlyMap<string, "loading" | "error">;
+  onToggle?: (sessionId: string) => void;
+  onRetryTurns?: (sessionId: string) => void;
 }
 
 export interface MapGraph {
@@ -51,7 +54,9 @@ export function buildMapGraph(options: MapGraphOptions): MapGraph {
     edges.push({
       id: `semantic:${session.sessionId}`,
       source: anchorExists ? turnNodeId(session.semanticParentSessionId, session.semanticAnchorTurnId!) : sessionNodeId(session.semanticParentSessionId),
+      sourceHandle: "branch-out",
       target: sessionNodeId(session.sessionId),
+      targetHandle: "branch-in",
       type: "smoothstep",
       className: `semantic-edge ${session.placementSource}`,
       label: session.semanticAnchorTurnId && !anchorExists ? "anchor hidden" : session.semanticRelation,
@@ -66,7 +71,7 @@ export function buildMapGraph(options: MapGraphOptions): MapGraph {
     edges.push({
       id: `native:${session.sessionId}`,
       source: exact ? turnNodeId(native.parentSessionId, native.originTurnId!) : sessionNodeId(native.parentSessionId),
-      target: sessionNodeId(session.sessionId), type: "smoothstep", className: "native-edge", label: "Native origin",
+      sourceHandle: "branch-out", target: sessionNodeId(session.sessionId), targetHandle: "branch-in", type: "smoothstep", className: "native-edge", label: "Native origin",
     });
   }
   const width = nodes.reduce((max, node) => Math.max(max, node.position.x + (node.type === "turn" ? 236 : SESSION_WIDTH)), 0) + 80;
@@ -82,7 +87,7 @@ function placeTree(session: SessionNodeData, x: number, top: number, options: Ma
   const expanded = options.expanded.has(session.sessionId);
   nodes.push({
     id: sessionNodeId(session.sessionId), type: "session", position, style: { width: SESSION_WIDTH, height },
-    data: { kind: "session", session, expanded, selected: options.selection?.kind === "session" && options.selection.sessionId === session.sessionId },
+    data: { kind: "session", session, expanded, selected: options.selection?.kind === "session" && options.selection.sessionId === session.sessionId, turnState: options.turnStates?.get(session.sessionId), onToggle: options.onToggle, onRetryTurns: options.onRetryTurns },
   });
   if (expanded) {
     const turns = options.turnDirectories.get(session.sessionId) ?? [];
@@ -92,7 +97,7 @@ function placeTree(session: SessionNodeData, x: number, top: number, options: Ma
         position: { x: 25, y: TURN_TOP + index * (TURN_HEIGHT + TURN_GAP) }, draggable: false,
         data: { kind: "turn", sessionId: session.sessionId, turn, selected: options.selection?.kind === "turn" && options.selection.nativeTurnId === turn.nativeTurnId },
       });
-      if (index) edges.push({ id: `turn:${session.sessionId}:${index}`, source: turnNodeId(session.sessionId, turns[index - 1].nativeTurnId), target: turnNodeId(session.sessionId, turn.nativeTurnId), type: "straight", className: "turn-chain-edge" });
+      if (index) edges.push({ id: `turn:${session.sessionId}:${index}`, source: turnNodeId(session.sessionId, turns[index - 1].nativeTurnId), sourceHandle: "chain-out", target: turnNodeId(session.sessionId, turn.nativeTurnId), targetHandle: "chain-in", type: "straight", className: "turn-chain-edge" });
     });
   }
   let childTop = top;

@@ -103,7 +103,7 @@ export interface LocalWebSemanticParents {
 }
 
 export interface LocalWebForest {
-  materialize(scopeId: string): Promise<SessionForest>;
+  materialize(scopeId: string, options?: { includeBranches?: boolean }): Promise<SessionForest>;
 }
 
 export interface LocalWebOrganizer {
@@ -471,7 +471,7 @@ async function handleApi(options: LocalWebServerOptions, request: IncomingMessag
   const forestMatch = url.pathname.match(/^\/api\/scopes\/([^/]+)\/forest$/);
   if (forestMatch) {
     if (!options.forest) return sendProblem(response, 503, "forest_unavailable", "Session Forest projection is unavailable.");
-    const forest = await options.forest.materialize(decodePathPart(forestMatch[1]));
+    const forest = await options.forest.materialize(decodePathPart(forestMatch[1]), { includeBranches: url.searchParams.get("branches") !== "0" });
     return sendJson(response, 200, { forest });
   }
 

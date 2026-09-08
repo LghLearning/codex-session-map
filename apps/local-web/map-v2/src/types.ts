@@ -55,6 +55,9 @@ export interface SessionMapNodeData extends Record<string, unknown> {
   session: SessionNodeData;
   expanded: boolean;
   selected: boolean;
+  turnState?: "loading" | "error";
+  onToggle?: (sessionId: string) => void;
+  onRetryTurns?: (sessionId: string) => void;
 }
 
 export interface TurnMapNodeData extends Record<string, unknown> {
@@ -68,4 +71,3 @@ export interface SectionMapNodeData extends Record<string, unknown> {
   kind: "section";
   label: string;
 }
-

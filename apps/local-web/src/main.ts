@@ -303,9 +303,22 @@ async function createForestProjection(values: readonly string[]): Promise<{ fore
         displayLabel: labels.get(turn.nativeTurnId) ?? traces.get(turn.nativeTurnId) ?? (turn.input?.text?.replace(/\s+/g, " ").trim().slice(0, 120) || `第 ${turn.displayOrdinal} 轮`),
       }));
     };
+    const countTurns = async (sessionId: string): Promise<number> => {
+      let count = 0, cursor: string | undefined;
+      const seen = new Set<string>();
+      do {
+        const page = await adapter.listTurns(sessionId, cursor);
+        count += page.data.length;
+        if (!page.nextCursor || seen.has(page.nextCursor)) break;
+        seen.add(page.nextCursor);
+        cursor = page.nextCursor;
+      } while (cursor);
+      return count;
+    };
     return {
       forest: {
-        materialize: async (scopeId) => {
+        materialize: async (scopeId, projectionOptions) => {
+          const includeBranches = projectionOptions?.includeBranches !== false;
           const sessions = (await listAllSessions(scopeId)).filter((session) => !session.excludedFromMainWorkspaceForest);
           const inputs = await Promise.all(sessions.map(async (session) => {
             const [semanticTitle, semanticParent, nativeLineage, traces, turns] = await Promise.all([
@@ -313,17 +326,18 @@ async function createForestProjection(values: readonly string[]): Promise<{ fore
               store.getSemanticParent(session.providerId, session.providerSessionId),
               adapter.getNativeLineage(session.providerSessionId),
               store.listSession(session.providerId, session.providerSessionId),
-              turnDirectory(session.providerId, session.providerSessionId),
+              includeBranches ? turnDirectory(session.providerId, session.providerSessionId) : countTurns(session.providerSessionId),
             ]);
             const labelled = store.overrides.list(session.providerId, "label", session.providerSessionId).filter((item) => item.value?.label);
             const traceCount = new Set([...traces.map((trace) => trace.nativeTurnId), ...labelled.map((item) => item.nativeTurnId)]).size;
-            return { session, semanticTitle, semanticParent, nativeLineage, turns, turnCount: turns.length, traceCount };
+            return { session, semanticTitle, semanticParent, nativeLineage, turns, turnCount: Array.isArray(turns) ? turns.length : turns, traceCount };
           }));
           const forestInputs = inputs.map(({ turns: _turns, ...input }) => input);
-          return {
-            ...materializeSessionForest(scopeId, forestInputs),
-            branches: projectSessionBranches(forestInputs, new Map(inputs.map((input) => [input.session.providerSessionId, input.turns]))),
-          };
+          const forest = materializeSessionForest(scopeId, forestInputs);
+          return includeBranches ? {
+            ...forest,
+            branches: projectSessionBranches(forestInputs, new Map(inputs.map((input) => [input.session.providerSessionId, input.turns as BranchTurn[]]))),
+          } : forest;
         },
       },
       databasePath,

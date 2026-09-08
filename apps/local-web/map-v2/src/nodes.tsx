@@ -8,10 +8,12 @@ export function SessionNode({ data }: NodeProps & { data: SessionMapNodeData }) 
     <Handle id="branch-out" type="source" position={Position.Right} className="map-handle branch-out" />
     <header>
       <span className="session-kicker">Session</span>
-      <button type="button" className="expand-control nodrag" aria-label={expanded ? "Collapse Session" : "Expand Session"} data-action="toggle-session">{expanded ? "−" : "+"}</button>
+      <button type="button" className="expand-control nodrag" aria-label={expanded ? "Collapse Session" : "Expand Session"} data-action="toggle-session" onClick={(event) => { if (!data.onToggle) return; event.stopPropagation(); data.onToggle(session.sessionId); }}>{expanded ? "−" : "+"}</button>
     </header>
     <strong title={session.displayTitle}>{session.displayTitle}</strong>
     <p>{session.turnCount} Turns <span>·</span> {formatRelative(session.updatedAt)}</p>
+    {data.turnState === "loading" && <span className="turn-load-state">Loading Turns…</span>}
+    {data.turnState === "error" && <span className="turn-load-state error">Unable to load Turns <button type="button" className="nodrag" onClick={(event) => { event.stopPropagation(); data.onRetryTurns?.(session.sessionId); }}>Retry</button></span>}
     <span className={`relation-mark ${session.placementSource}`}>{session.placementSource === "none" ? "Unorganized" : session.placementSource === "user" ? "User placed" : "AI suggested"}</span>
     <Handle id="reparent" type="source" position={Position.Bottom} className="map-handle relation-handle" title="Drag to a parent Session or Turn" />
   </article>;

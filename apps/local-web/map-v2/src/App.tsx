@@ -4,11 +4,13 @@ import { buildMapGraph } from "./graph.ts";
 import { prototypeForest, prototypeTurns } from "./fixture.ts";
 import { SectionNode, SessionNode, TurnNode } from "./nodes.tsx";
 import type { PersistedWorkspaceState, Selection } from "./types.ts";
+import RealWorkspace from "./RealWorkspace.tsx";
 
 const nodeTypes = { session: SessionNode, turn: TurnNode, section: SectionNode };
 
 export default function App() {
-  return <ReactFlowProvider><MapPrototype /></ReactFlowProvider>;
+  const fixture = new URLSearchParams(location.search).has("fixture");
+  return <ReactFlowProvider>{fixture ? <MapPrototype /> : <RealWorkspace />}</ReactFlowProvider>;
 }
 
 function MapPrototype() {

@@ -110,7 +110,8 @@ test("local web API is loopback-only, paginated, read-only, and provider-neutral
   const semanticTraces = new FakeSemanticTraces();
   const semanticTitles = new FakeSemanticTitles();
   const semanticParents = new FakeSemanticParents();
-  const forest = { materialize: async (scopeId: string) => materializeSessionForest(scopeId, sessions.filter((item) => !item.excludedFromMainWorkspaceForest).map((item) => ({ session: item, turnCount: item.providerSessionId === "visible-a" ? 1 : 0, traceCount: 0 }))) };
+  let forestOptions: { includeBranches?: boolean } | undefined;
+  const forest = { materialize: async (scopeId: string, options?: { includeBranches?: boolean }) => { forestOptions = options; return materializeSessionForest(scopeId, sessions.filter((item) => !item.excludedFromMainWorkspaceForest).map((item) => ({ session: item, turnCount: item.providerSessionId === "visible-a" ? 1 : 0, traceCount: 0 }))); } };
   const organizer = new FakeOrganizer();
   const environment = { version: "0.1.0-alpha", readOnly: true as const, ollama: { endpoint: "http://127.0.0.1:11434", available: true, model: "qwen3.5", thinking: "off" as const }, semanticStore: { available: true, path: "C:\\fixture\\semantic.sqlite", schemaVersion: 4 } };
   const running = await createLocalWebServer({ provider, semanticTraces, semanticTitles, semanticParents, forest, organizer, environment, port: 0, pageSize: 1 }).start();
@@ -159,6 +160,9 @@ test("local web API is loopback-only, paginated, read-only, and provider-neutral
   assert.equal(projectedForest.forest.stats.confirmedRoots, 0);
   assert.equal(projectedForest.forest.stats.unorganized, 2);
   assert.equal(projectedForest.forest.unorganized.some((node: any) => node.sessionId === "visible-a"), true);
+  assert.equal(forestOptions?.includeBranches, true);
+  await json(`${running.url}/api/scopes/${encodeURIComponent(scope.id)}/forest?branches=0`);
+  assert.equal(forestOptions?.includeBranches, false);
 
   const organizeResponse = await fetch(`${running.url}/api/scopes/${encodeURIComponent(scope.id)}/organize`, { method: "POST", headers: { Origin: running.url } });
   assert.equal(organizeResponse.status, 202);
