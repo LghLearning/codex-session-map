@@ -3,6 +3,20 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node src/main.ts"
+    "start": "node src/main.ts",
+    "build:map": "vite build --config vite.map.config.ts",
+    "typecheck:map": "tsc -p map-v2/tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@xyflow/react": "12.11.6",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@vitejs/plugin-react": "^6.1.1",
+    "typescript": "^7.0.2",
+    "vite": "8.2.2"
   }
 }

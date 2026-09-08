@@ -2,6 +2,7 @@ node_modules/
 .DS_Store
 coverage/
 dist/
+apps/local-web/public/map-v2/
 *.log
 .codex-session-map/
 .env
