@@ -26,6 +26,7 @@ import type { Session, Turn } from "../../../packages/core/src/index.ts";
 import { materializeSessionForest, projectSessionBranches, type BranchTurn } from "../../../packages/forest/src/index.ts";
 import { organizeWorkspace } from "../../../packages/organizer/src/index.ts";
 import { createLocalWebServer, type LocalWebEnvironment, type LocalWebForest, type LocalWebOrganizer, type LocalWebSemanticParents, type LocalWebSemanticTitles, type LocalWebSemanticTraces } from "./server.ts";
+import { WorkspaceSearchIndex } from "./search-index.ts";
 
 const PRODUCT_VERSION = "0.1.0-alpha";
 let semanticUnavailableReason: string | undefined;
@@ -43,6 +44,7 @@ const adapter = new CodexAdapterV1({
 });
 const forestProjection = await createForestProjection(args);
 const semantic = await createSemanticPreview(args);
+const search = await createSearchIndex(args, semantic?.store);
 const app = createLocalWebServer({
   provider: adapter,
   port,
@@ -52,6 +54,7 @@ const app = createLocalWebServer({
   userOverrides: semantic?.store,
   forest: forestProjection?.forest,
   organizer: semantic?.generationAvailable ? semantic.organizer : undefined,
+  search,
   semanticGenerationAvailable: semantic?.generationAvailable ?? false,
   environment: environmentStatus(args, semantic, forestProjection),
   semanticTraceUnavailableReason: semantic ? undefined : semanticUnavailableReason ?? "Local Ollama/qwen3.5 is unavailable. The read-only Explorer remains usable.",
@@ -65,10 +68,22 @@ console.log(semantic?.generationAvailable ? "Local AI generation is available on
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, async () => {
   await running.close();
+  await search?.close();
   await semantic?.close();
   await forestProjection?.close();
   process.exit(0);
 });
+
+async function createSearchIndex(values: readonly string[], store?: SqliteSemanticTraceStore): Promise<WorkspaceSearchIndex | undefined> {
+  try {
+    const databasePath = resolve(valueAfter(values, "--search-index") ?? ".codex-session-map/search.sqlite");
+    await mkdir(dirname(databasePath), { recursive: true });
+    return new WorkspaceSearchIndex({ databasePath, provider: adapter, semantic: store });
+  } catch (error) {
+    console.warn(`Workspace search disabled: ${error instanceof Error ? error.message : "unknown search index error"}`);
+    return undefined;
+  }
+}
 
 async function createSemanticPreview(values: readonly string[]): Promise<{ store: SqliteSemanticTraceStore; service: LocalWebSemanticTraces; titles: LocalWebSemanticTitles; parents: LocalWebSemanticParents; organizer: LocalWebOrganizer; generationAvailable: boolean; modelIdentity?: string; close(): Promise<void> } | undefined> {
   try {

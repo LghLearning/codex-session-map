@@ -8,6 +8,7 @@ import { UserEditError, normalizeSemanticSessionTitle, normalizeTraceText, type 
 import type { SessionForest } from "../../../packages/forest/src/index.ts";
 import type { WorkspaceOrganizationProgress, WorkspaceOrganizationResult } from "../../../packages/organizer/src/index.ts";
 import { projectTranscriptTurn } from "../../../packages/transcript/src/index.ts";
+import type { SearchSourceKind, WorkspaceSearchPort } from "./search-index.ts";
 
 export interface LocalWebDiagnostics {
   readonly code: string;
@@ -36,6 +37,7 @@ export interface LocalWebServerOptions {
   readonly userOverrides?: SqliteSemanticTraceStore;
   readonly forest?: LocalWebForest;
   readonly organizer?: LocalWebOrganizer;
+  readonly search?: WorkspaceSearchPort;
   readonly environment?: LocalWebEnvironment;
   readonly publicDirectory?: string;
   readonly host?: string;
@@ -237,6 +239,7 @@ async function handleApi(options: LocalWebServerOptions, request: IncomingMessag
         await validateTurnAnchor(provider, session, value.parentSessionId, value.anchorTurnId);
       }
       edit = store.overrides.write(key, session.workspaceScopeId, value, requireRevision(body.revision), sessions);
+      options.search?.refreshSession(session.providerSessionId);
     }
     const override = store.overrides.read(key) ?? { ...key, value: null, revision: 0 };
     return sendJson(response, 200, {
@@ -267,6 +270,7 @@ async function handleApi(options: LocalWebServerOptions, request: IncomingMessag
     const trace = force && options.semanticTraces.regenerate
       ? await options.semanticTraces.regenerate(turn)
       : await options.semanticTraces.ensure(turn);
+    options.search?.refreshSession(sessionId);
     const feedback = await options.semanticTraces.getUserFeedback?.(turn);
     return sendJson(response, 200, { semanticTrace: projectSemanticTrace("current", trace, options.semanticTraces.inspectSafety?.(turn, trace), feedback, trace.inputFingerprint) });
   }
@@ -289,6 +293,7 @@ async function handleApi(options: LocalWebServerOptions, request: IncomingMessag
       reviewedAt: new Date().toISOString(),
     };
     await options.semanticTraces.putUserFeedback(turn, feedback);
+    options.search?.refreshSession(sessionId);
     return sendJson(response, 200, {
       semanticTrace: projectSemanticTrace(lookup.freshness, lookup.trace, options.semanticTraces.inspectSafety?.(turn, lookup.trace), feedback, lookup.currentInputFingerprint),
     });
@@ -306,6 +311,7 @@ async function handleApi(options: LocalWebServerOptions, request: IncomingMessag
     const turns = await loadAllTurns(provider, session.providerSessionId);
     if (request.method === "POST") {
       const title = await options.semanticTitles.generate(session, turns);
+      options.search?.refreshSession(session.providerSessionId);
       return sendJson(response, 200, { semanticTitle: projectSemanticTitle(session.title, title, "current") });
     }
     const lookup = await options.semanticTitles.inspect(session, turns);
@@ -318,6 +324,7 @@ async function handleApi(options: LocalWebServerOptions, request: IncomingMessag
     const session = await provider.readSession(decodePathPart(titleEditMatch[1]));
     const body = await readJsonBody(request);
     const title = await options.semanticTitles.edit(session, requireSemanticTitle(body.title));
+    options.search?.refreshSession(session.providerSessionId);
     const turns = await loadAllTurns(provider, session.providerSessionId);
     const lookup = await options.semanticTitles.inspect(session, turns);
     return sendJson(response, 200, { semanticTitle: projectSemanticTitle(session.title, title, lookup.freshness) });
@@ -359,7 +366,7 @@ async function handleApi(options: LocalWebServerOptions, request: IncomingMessag
       progress: { phase: "titles", sessions: 0, titlesProcessed: 0, titlesGenerated: 0, relationshipsProcessed: 0, relationshipsGenerated: 0, warnings: 0 },
     };
     organizationJobs.set(job.id, job);
-    void runOrganizationJob(options.organizer, job);
+    void runOrganizationJob(options.organizer, job).finally(() => options.search?.reconcile());
     return sendJson(response, 202, { job: projectOrganizationJob(job) });
   }
   const organizeCancelMatch = url.pathname.match(/^\/api\/organize\/([^/]+)\/cancel$/);
@@ -372,6 +379,22 @@ async function handleApi(options: LocalWebServerOptions, request: IncomingMessag
   }
   if (request.method !== "GET" && request.method !== "HEAD") return sendProblem(response, 405, "method_not_allowed", "The local API is read-only.");
 
+  const searchStatusMatch = url.pathname.match(/^\/api\/scopes\/([^/]+)\/search\/status$/);
+  if (searchStatusMatch) {
+    if (!options.search) return sendProblem(response, 503, "search_unavailable", "Workspace search index is unavailable.");
+    const workspaceId = decodePathPart(searchStatusMatch[1]);
+    options.search.start(workspaceId);
+    return sendJson(response, 200, { index: options.search.status(workspaceId) });
+  }
+  const searchMatch = url.pathname.match(/^\/api\/scopes\/([^/]+)\/search$/);
+  if (searchMatch) {
+    if (!options.search) return sendProblem(response, 503, "search_unavailable", "Workspace search index is unavailable.");
+    const sourceKinds = url.searchParams.getAll("kind") as SearchSourceKind[];
+    return sendJson(response, 200, options.search.query(decodePathPart(searchMatch[1]), url.searchParams.get("q") ?? "", {
+      limit: Number(url.searchParams.get("limit") ?? 20), cursor: url.searchParams.get("cursor") ?? undefined, sourceKinds,
+    }));
+  }
+
   if (url.pathname === "/api/health") return sendJson(response, 200, { ok: true, upstreamPolicy: "read_only" });
   if (url.pathname === "/api/events") {
     if (!provider.subscribeUpdates) return sendProblem(response, 501, "live_updates_unavailable", "This provider does not expose live updates.");
@@ -383,6 +406,7 @@ async function handleApi(options: LocalWebServerOptions, request: IncomingMessag
     eventResponses.add(response);
     response.write("event: ready\ndata: {}\n\n");
     const unsubscribe = await provider.subscribeUpdates((update) => {
+      options.search?.reconcile();
       if (!response.destroyed) response.write(`event: snapshot\ndata: ${JSON.stringify(update)}\n\n`);
     });
     const heartbeat = setInterval(() => { if (!response.destroyed) response.write(": keep-alive\n\n"); }, 15_000);
@@ -429,6 +453,7 @@ async function handleApi(options: LocalWebServerOptions, request: IncomingMessag
         available: Boolean(options.organizer),
         mode: "manual_current_workspace",
       },
+      search: { available: Boolean(options.search), mode: "fts5_trigram_with_short_substring_fallback" },
       environment: options.environment,
     });
   }
