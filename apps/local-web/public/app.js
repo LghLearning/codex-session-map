@@ -276,6 +276,7 @@ function applyNavigationSnapshot(snapshot, historyMode, preserveScroll) {
   if (snapshot.target.scopeId) mapUrl.searchParams.set("workspace", snapshot.target.scopeId);
   if (snapshot.target.sessionId) mapUrl.searchParams.set("session", snapshot.target.sessionId);
   if (snapshot.target.turnId) mapUrl.searchParams.set("turn", snapshot.target.turnId);
+  if (new URL(window.location.href).searchParams.get("q")) mapUrl.searchParams.set("q", new URL(window.location.href).searchParams.get("q"));
   elements["map-v2-link"].href = `${mapUrl.pathname}${mapUrl.search}`;
   state.turns = snapshot.turns;
   state.turnCursor = snapshot.turnCursor;

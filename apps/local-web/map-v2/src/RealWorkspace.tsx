@@ -253,9 +253,10 @@ export default function RealWorkspace() {
 
   const sessions = forest ? flattenSessions([...forest.roots, ...forest.unorganized]) : [];
   const selectedNode = selection ? sessions.find((session) => session.sessionId === selection.sessionId) : undefined;
-  const legacyHref = selection?.kind === "turn"
+  const legacyPath = selection?.kind === "turn"
     ? `/workspaces/${encodeURIComponent(workspace)}/sessions/${encodeURIComponent(selection.sessionId)}/turns/${encodeURIComponent(selection.nativeTurnId)}`
     : selection ? `/workspaces/${encodeURIComponent(workspace)}/sessions/${encodeURIComponent(selection.sessionId)}` : `/workspaces/${encodeURIComponent(workspace)}`;
+  const legacyHref = search.query ? `${legacyPath}?q=${encodeURIComponent(search.query)}` : legacyPath;
 
   return <main className={`map-shell ${railCollapsed ? "rail-collapsed" : ""}`}>
     <header className="map-topbar">
