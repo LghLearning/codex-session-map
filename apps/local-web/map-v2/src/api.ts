@@ -1,4 +1,4 @@
-import type { MapForest, Relation, TurnDirectoryItem } from "./types.ts";
+import type { MapForest, Relation, SearchIndexStatus, SearchPage, TurnDirectoryItem } from "./types.ts";
 
 export interface Bootstrap {
   scopes: { id: string; displayName: string }[];
@@ -8,6 +8,7 @@ export interface Bootstrap {
   semanticParents?: { available: boolean; generationAvailable: boolean };
   userOverrides?: { available: boolean };
   organizer?: { available: boolean };
+  search?: { available: boolean; mode: string };
 }
 
 export async function getBootstrap(signal?: AbortSignal): Promise<Bootstrap> { return api("/api/bootstrap", { signal }); }
@@ -36,6 +37,14 @@ export async function getSessionDetail(sessionId: string, signal?: AbortSignal):
 }
 export async function getTurnDetail(sessionId: string, nativeTurnId: string, signal?: AbortSignal): Promise<any> {
   return (await api(`/api/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(nativeTurnId)}`, { signal })).turn;
+}
+export async function searchWorkspace(workspace: string, query: string, options: { cursor?: string; limit?: number; signal?: AbortSignal } = {}): Promise<SearchPage> {
+  const params = new URLSearchParams({ q: query, limit: String(options.limit ?? 20) });
+  if (options.cursor) params.set("cursor", options.cursor);
+  return api(`/api/scopes/${encodeURIComponent(workspace)}/search?${params}`, { signal: options.signal });
+}
+export async function getSearchStatus(workspace: string, signal?: AbortSignal): Promise<SearchIndexStatus> {
+  return (await api(`/api/scopes/${encodeURIComponent(workspace)}/search/status`, { signal })).index;
 }
 export async function getManualParents(sessionId: string, signal?: AbortSignal): Promise<any[]> {
   return (await api(`/api/sessions/${encodeURIComponent(sessionId)}/manual-parents`, { signal })).candidates;

@@ -1,11 +1,15 @@
 import { Background, Controls, MiniMap, ReactFlow, useNodesState, useReactFlow, type Connection, type NodeMouseHandler, type Viewport } from "@xyflow/react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getBootstrap, getForest, getManualParents, getOrganization, getOverride, getSessionDetail, getTurnDetail, getTurnDirectory, latestEdit, startOrganization, undoEdit, writeOverride, writePlacement, type Bootstrap } from "./api.ts";
-import { buildMapGraph, flattenSessions, sessionNodeId } from "./graph.ts";
+import { buildMapGraph, flattenSessions } from "./graph.ts";
 import { SectionNode, SessionNode, TurnNode } from "./nodes.tsx";
 import { connectionToPlacement, type PlacementDraft } from "./placement.ts";
-import type { MapForest, PersistedWorkspaceState, Relation, Selection, SessionNodeData, TurnDirectoryItem } from "./types.ts";
+import type { MapForest, PersistedWorkspaceState, Relation, SearchResult, Selection, SessionNodeData, TurnDirectoryItem } from "./types.ts";
 import { RequestSequence, readLastWorkspace, readWorkspaceState, resolveRestoredSelection, saveLastWorkspace, saveWorkspaceState, updateMapUrl } from "./workspace-state.ts";
+import { SearchPanel } from "./search/SearchPanel.tsx";
+import { useWorkspaceSearch } from "./search/useWorkspaceSearch.ts";
+import { resolveSearchNavigation } from "./search/navigation.ts";
+import { TurnReader } from "./reader/TurnReader.tsx";
 
 const nodeTypes = { session: SessionNode, turn: TurnNode, section: SectionNode };
 const MAX_EXPANDED = 12;
@@ -14,6 +18,7 @@ export default function RealWorkspace() {
   const flow = useReactFlow();
   const requestSequence = useRef(new RequestSequence());
   const fitUnseenWorkspace = useRef(false);
+  const pendingLocate = useRef<string | undefined>(undefined);
   const expandedRef = useRef<ReadonlySet<string>>(new Set());
   const [bootstrap, setBootstrap] = useState<Bootstrap>();
   const [workspace, setWorkspace] = useState("");
@@ -35,6 +40,7 @@ export default function RealWorkspace() {
   const [forestError, setForestError] = useState("");
   const [loading, setLoading] = useState(true);
   const [organizing, setOrganizing] = useState(false);
+  const search = useWorkspaceSearch(workspace, Boolean(bootstrap?.search?.available));
 
   const reloadForest = useCallback(async (targetWorkspace: string, signal?: AbortSignal) => {
     const token = requestSequence.current.start();
@@ -135,6 +141,16 @@ export default function RealWorkspace() {
   const graph = useMemo(() => forest ? buildMapGraph({ forest, expanded, turnDirectories: turns, selection, positions, showNative, turnStates, onToggle: toggle, onRetryTurns: (sessionId) => void reloadTurnDirectory(sessionId).catch(() => undefined) }) : { nodes: [], edges: [], bounds: { width: 0, height: 0 } }, [forest, expanded, turns, selection, positions, showNative, turnStates, toggle, reloadTurnDirectory]);
   const [renderNodes, setRenderNodes, onNodesChange] = useNodesState(graph.nodes);
   useEffect(() => setRenderNodes(graph.nodes), [graph.nodes, setRenderNodes]);
+  useEffect(() => {
+    if (!pendingLocate.current) return;
+    const node = renderNodes.find((item) => item.id === pendingLocate.current);
+    if (!node) return;
+    pendingLocate.current = undefined;
+    const parent = node.parentId ? renderNodes.find((item) => item.id === node.parentId) : undefined;
+    const x = node.position.x + (parent?.position.x ?? 0) + (node.measured?.width ?? 236) / 2;
+    const y = node.position.y + (parent?.position.y ?? 0) + (node.measured?.height ?? 56) / 2;
+    requestAnimationFrame(() => void flow.setCenter(x, y, { zoom: Math.max(flow.getZoom(), .78), duration: 280 }));
+  }, [renderNodes, flow]);
   useEffect(() => { if (viewport) void flow.setViewport(viewport); }, [workspace]);
   useEffect(() => {
     if (!fitUnseenWorkspace.current || !renderNodes.length) return;
@@ -159,6 +175,12 @@ export default function RealWorkspace() {
       setPlacement(next);
     } catch (error) { setNotice((error as Error).message); }
   }, [renderNodes]);
+
+  function selectSearchResult(result: SearchResult) {
+    const navigation = resolveSearchNavigation(result, expanded, MAX_EXPANDED);
+    pendingLocate.current = navigation.nodeId;
+    setExpanded(navigation.expanded); setSelection(navigation.selection);
+  }
 
   async function switchWorkspace(next: string) {
     if (!next || next === workspace) return;
@@ -239,11 +261,7 @@ export default function RealWorkspace() {
     <header className="map-topbar">
       <button className="brand" type="button" onClick={() => setRailCollapsed((value) => !value)}>Codex Session Map</button>
       <select aria-label="Workspace" value={workspace} onChange={(event) => void switchWorkspace(event.target.value)}>{bootstrap?.scopes.map((scope) => <option key={scope.id} value={scope.id}>{scope.displayName}</option>)}</select>
-      <input aria-label="Locate Session title" placeholder="Locate Session title…" onChange={(event) => {
-        const found = sessions.find((session) => session.displayTitle.toLocaleLowerCase().includes(event.target.value.toLocaleLowerCase()));
-        const node = found && renderNodes.find((item) => item.id === sessionNodeId(found.sessionId));
-        if (event.target.value && found && node) { select({ kind: "session", sessionId: found.sessionId }); void flow.setCenter(node.position.x + 146, node.position.y + 50, { zoom: 0.9, duration: 250 }); }
-      }} />
+      <SearchPanel query={search.query} setQuery={search.setQuery} results={search.page?.results ?? []} index={search.index} loading={search.loading} error={search.error} nextCursor={search.page?.nextCursor} loadMore={() => void search.loadMore()} onSelect={selectSearchResult} />
       <div className="view-tabs"><button className="active" type="button">Map</button><a href={legacyHref}>List</a></div>
       <button type="button" className="subtle" disabled={!bootstrap?.organizer?.available || organizing} title={bootstrap?.organizer?.available ? "Organize this Workspace" : "AI generation unavailable"} onClick={() => void organize()}>{organizing ? "Organizing…" : "Organize"}</button>
       <button type="button" className="subtle" onClick={() => void performUndo()}>Undo</button>
@@ -267,7 +285,7 @@ export default function RealWorkspace() {
       ><Background gap={26} size={1} color="#dbe2dc" /><MiniMap pannable zoomable nodeStrokeWidth={3} /><Controls showInteractive={false} /></ReactFlow>}
       <output className="map-notice">{notice}{lastEdit && <button type="button" onClick={() => void performUndo()}>Undo</button>}</output>
     </section>
-    {selection && <DetailDrawer selection={selection} session={selectedNode} detail={detail} error={detailError} draft={draft} setDraft={setDraft} saveDraft={saveDraft} restoreAutomatic={restoreAutomatic} setRoot={setRoot} close={() => setSelection(undefined)} beginMove={async () => {
+    {selection && <DetailDrawer selection={selection} session={selectedNode} turn={selection.kind === "turn" ? turns.get(selection.sessionId)?.find((item) => item.nativeTurnId === selection.nativeTurnId) : undefined} directory={selection.kind === "turn" ? turns.get(selection.sessionId) ?? [] : []} detail={detail} error={detailError} onNavigateTurn={(turn: TurnDirectoryItem) => select({ kind: "turn", sessionId: selection.sessionId, nativeTurnId: turn.nativeTurnId })} draft={draft} setDraft={setDraft} saveDraft={saveDraft} restoreAutomatic={restoreAutomatic} setRoot={setRoot} close={() => setSelection(undefined)} beginMove={async () => {
       try { const candidates = await getManualParents(selection.sessionId); setPlacement({ childSessionId: selection.sessionId, parentSessionId: candidates[0]?.sessionId ?? "", relation: selectedNode?.semanticRelation === "continuation" ? "continuation" : "subtask", legalParentIds: candidates.map((candidate) => candidate.sessionId) }); }
       catch (error) { setNotice((error as Error).message); }
     }} />}
@@ -276,10 +294,11 @@ export default function RealWorkspace() {
 }
 
 function DetailDrawer(props: any) {
-  const title = props.selection.kind === "turn" ? props.detail?.semanticTrace?.navigationLabel ?? props.session?.displayTitle : props.detail?.semanticTitle?.displayTitle ?? props.session?.displayTitle;
-  return <aside className="detail-drawer"><button type="button" className="drawer-close" aria-label="Close detail" onClick={props.close}>×</button><span className="drawer-kicker">{props.selection.kind} detail</span><h2>{title ?? "Loading…"}</h2>
-    {props.error && <p className="drawer-error">{props.error} <button type="button" onClick={props.close}>Close</button></p>}
-    {props.selection.kind === "session" ? <><p>{props.detail?.semanticParent?.relation ? `${props.detail.semanticParent.relation} · ${props.detail.semanticParent.authority}` : "Unorganized"}</p><dl><dt>Turns</dt><dd>{props.session?.turnCount}</dd><dt>Original title</dt><dd>{props.detail?.semanticTitle?.originalTitle ?? props.session?.originalTitle}</dd><dt>Semantic anchor</dt><dd>{props.detail?.semanticParent?.anchorTurnId ?? "Session level"}</dd><dt>Native origin</dt><dd>{props.detail?.semanticParent?.nativeLineage?.originTurnId ?? "None"}</dd></dl></> : <><p className="drawer-content">{props.detail?.input}</p><p className="drawer-content assistant">{props.detail?.assistantFinal}</p></>}
+  const title = props.selection.kind === "turn" ? props.detail?.semanticTrace?.navigationLabel ?? props.turn?.displayLabel ?? `Turn ${props.selection.nativeTurnId}` : props.detail?.semanticTitle?.displayTitle ?? props.session?.displayTitle;
+  const heading = props.selection.kind === "turn" && props.turn ? `T${props.turn.displayOrdinal} · ${title}` : title;
+  return <aside className="detail-drawer"><button type="button" className="drawer-close" aria-label="Close detail" onClick={props.close}>×</button><span className="drawer-kicker">{props.selection.kind} detail</span><h2>{heading ?? "Loading…"}</h2>
+    {props.error && props.selection.kind === "session" && <p className="drawer-error">{props.error} <button type="button" onClick={props.close}>Close</button></p>}
+    {props.selection.kind === "session" ? <><p>{props.detail?.semanticParent?.relation ? `${props.detail.semanticParent.relation} · ${props.detail.semanticParent.authority}` : "Unorganized"}</p><dl><dt>Turns</dt><dd>{props.session?.turnCount}</dd><dt>Original title</dt><dd>{props.detail?.semanticTitle?.originalTitle ?? props.session?.originalTitle}</dd><dt>Semantic anchor</dt><dd>{props.detail?.semanticParent?.anchorTurnId ?? "Session level"}</dd><dt>Native origin</dt><dd>{props.detail?.semanticParent?.nativeLineage?.originTurnId ?? "None"}</dd></dl></> : <TurnReader nativeTurnId={props.selection.nativeTurnId} directory={props.directory} detail={props.detail} error={props.error} onNavigate={props.onNavigateTurn} />}
     {props.draft ? <div className="drawer-edit"><textarea autoFocus value={props.draft.value} onChange={(event) => props.setDraft({ ...props.draft, value: event.target.value })} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void props.saveDraft(); } }} /><button type="button" onClick={props.saveDraft}>Save</button><button type="button" onClick={() => props.setDraft(undefined)}>Cancel</button></div> : <div className="drawer-actions">
       <button type="button" onClick={() => props.setDraft({ kind: props.selection.kind === "turn" ? "label" : "title", value: title ?? "" })}>{props.selection.kind === "turn" ? "Edit label" : "Rename"}</button>
       {props.selection.kind === "session" && <><button type="button" onClick={props.beginMove}>Move</button><button type="button" onClick={() => props.setRoot(props.selection.sessionId)}>Set root</button></>}
