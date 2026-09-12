@@ -1,5 +1,5 @@
 import type { Turn } from "../../core/src/index.ts";
-import type { GeneratedSemanticTrace, TurnSemanticTraceGenerator } from "./index.ts";
+import type { GeneratedSemanticTrace, SemanticGenerationOptions, TurnSemanticTraceGenerator } from "./index.ts";
 import { inspectSemanticTraceSafety, type SemanticSafetyInspection } from "./semantic-safety.ts";
 
 export interface SemanticTraceCompletionRequest {
@@ -8,6 +8,7 @@ export interface SemanticTraceCompletionRequest {
   readonly maxOutputCharacters: number;
   readonly responseFormat?: "json";
   readonly responseJsonSchema?: Readonly<Record<string, unknown>>;
+  readonly signal?: AbortSignal;
 }
 
 export interface SemanticTraceCompletionClient {
@@ -54,8 +55,8 @@ export class PromptTurnSemanticTraceGenerator implements TurnSemanticTraceGenera
     };
   }
 
-  async generate(turn: Turn): Promise<GeneratedSemanticTrace> {
-    const request = this.#requestBuilder(turn);
+  async generate(turn: Turn, options?: SemanticGenerationOptions): Promise<GeneratedSemanticTrace> {
+    const request = { ...this.#requestBuilder(turn), signal: options?.signal };
     const first = await this.#client.complete(request);
     const firstInspection = inspectSemanticTraceSafety(turn, first);
     const guardTriggered = this.#safetyGuard && firstInspection.statusUpgradeSuspected;

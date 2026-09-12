@@ -3,6 +3,7 @@ import type { Session, Turn, TurnSemanticTrace } from "../../core/src/index.ts";
 import { semanticSessionContentFingerprint } from "./index.ts";
 import type {
   GeneratedSemanticSessionTitle,
+  SemanticGenerationOptions,
   SemanticSessionTitleGenerator,
   SemanticSessionTitleSource,
   SemanticTraceUserFeedback,
@@ -25,8 +26,8 @@ export class PromptSemanticSessionTitleGenerator implements SemanticSessionTitle
     };
   }
 
-  async generate(source: SemanticSessionTitleSource): Promise<GeneratedSemanticSessionTitle> {
-    return { title: await this.#client.complete(buildSemanticSessionTitleRequest(source)) };
+  async generate(source: SemanticSessionTitleSource, options?: SemanticGenerationOptions): Promise<GeneratedSemanticSessionTitle> {
+    return { title: await this.#client.complete({ ...buildSemanticSessionTitleRequest(source), signal: options?.signal }) };
   }
 }
 

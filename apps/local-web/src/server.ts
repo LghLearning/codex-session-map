@@ -6,7 +6,7 @@ import type { NativeLineage, SemanticTraceLookup, Session, SessionProvider, Sess
 import type { SemanticParentCandidate, SemanticParentEdge, SemanticParentLookup, SemanticParentRelation } from "../../../packages/semantic-store/src/index.ts";
 import { UserEditError, normalizeSemanticSessionTitle, normalizeTraceText, type SqliteSemanticTraceStore, type UserField, type UserValue } from "../../../packages/semantic-store/src/index.ts";
 import type { SessionForest } from "../../../packages/forest/src/index.ts";
-import type { WorkspaceOrganizationProgress, WorkspaceOrganizationResult } from "../../../packages/organizer/src/index.ts";
+import type { OrganizationItem, OrganizationJob, OrganizationMode, OrganizationRequest, WorkspaceOrganizationProgress, WorkspaceOrganizationResult } from "../../../packages/organizer/src/index.ts";
 import { projectTranscriptTurn } from "../../../packages/transcript/src/index.ts";
 import type { SearchSourceKind, WorkspaceSearchPort } from "./search-index.ts";
 
@@ -109,7 +109,17 @@ export interface LocalWebForest {
 }
 
 export interface LocalWebOrganizer {
-  organize(scopeId: string, options: { signal: AbortSignal; onProgress(progress: WorkspaceOrganizationProgress): void }): Promise<WorkspaceOrganizationResult>;
+  /** Progressive E API. Legacy organize remains optional during migration and tests. */
+  start?(request: OrganizationRequest): Promise<OrganizationJob>;
+  get?(jobId: string): OrganizationJob | undefined;
+  latest?(workspaceId: string): OrganizationJob | undefined;
+  items?(jobId: string): readonly OrganizationItem[];
+  pause?(jobId: string): OrganizationJob;
+  resume?(jobId: string): OrganizationJob;
+  cancel?(jobId: string): OrganizationJob;
+  retryFailed?(jobId: string): OrganizationJob;
+  shutdown?(): void | Promise<void>;
+  organize?(scopeId: string, options: { signal: AbortSignal; onProgress(progress: WorkspaceOrganizationProgress): void }): Promise<WorkspaceOrganizationResult>;
 }
 
 export interface LocalWebEnvironment {
@@ -119,7 +129,7 @@ export interface LocalWebEnvironment {
   readonly semanticStore: { readonly available: boolean; readonly path: string; readonly schemaVersion: number };
 }
 
-interface OrganizationJob {
+interface LegacyOrganizationJob {
   readonly id: string;
   readonly scopeId: string;
   readonly controller: AbortController;
@@ -150,7 +160,7 @@ export function createLocalWebServer(options: LocalWebServerOptions): {
   const publicDirectory = options.publicDirectory ?? DEFAULT_PUBLIC_DIRECTORY;
   const pageSize = clamp(options.pageSize ?? 60, 1, 200);
   const eventResponses = new Set<ServerResponse>();
-  const organizationJobs = new Map<string, OrganizationJob>();
+  const organizationJobs = new Map<string, LegacyOrganizationJob>();
   const server = createServer(async (request, response) => {
     try {
       if (!isAllowedHost(request.headers.host)) return sendProblem(response, 421, "misdirected_request", "Only loopback Host headers are accepted.");
@@ -185,6 +195,7 @@ export function createLocalWebServer(options: LocalWebServerOptions): {
         url,
         close: () => new Promise<void>((resolveClose, reject) => {
           for (const job of organizationJobs.values()) if (job.status === "running") job.controller.abort();
+          options.organizer?.shutdown?.();
           for (const eventResponse of eventResponses) eventResponse.end();
           server.close((error) => error ? reject(error) : resolveClose());
         }),
@@ -193,7 +204,7 @@ export function createLocalWebServer(options: LocalWebServerOptions): {
   };
 }
 
-async function handleApi(options: LocalWebServerOptions, request: IncomingMessage, response: ServerResponse, url: URL, pageSize: number, eventResponses: Set<ServerResponse>, organizationJobs: Map<string, OrganizationJob>): Promise<void> {
+async function handleApi(options: LocalWebServerOptions, request: IncomingMessage, response: ServerResponse, url: URL, pageSize: number, eventResponses: Set<ServerResponse>, organizationJobs: Map<string, LegacyOrganizationJob>): Promise<void> {
   const provider = options.provider;
   const overrideMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/user-overrides\/(title|label|parent)$/);
   const manualCandidatesMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/manual-parents$/);
@@ -359,9 +370,28 @@ async function handleApi(options: LocalWebServerOptions, request: IncomingMessag
     if (!sameOrigin(request)) return sendProblem(response, 403, "cross_origin_denied", "Workspace organization is available only to the local UI origin.");
     if (!options.organizer) return sendProblem(response, 503, "organizer_unavailable", "AI generation is unavailable; existing Forest data remains readable.");
     const scopeId = decodePathPart(organizeStartMatch[1]);
+    if (options.organizer.start) {
+      const body = Number(request.headers["content-length"] ?? 0) > 0 ? await readJsonBody(request) : {};
+      const mode: OrganizationMode = body.mode === "full" ? "full" : "quick";
+      try {
+        const job = await options.organizer.start({
+          workspaceId: scopeId, mode,
+          sessionId: typeof body.sessionId === "string" ? body.sessionId : undefined,
+          selectedSessionId: typeof body.selectedSessionId === "string" ? body.selectedSessionId : undefined,
+          expandedSessionIds: Array.isArray(body.expandedSessionIds) ? body.expandedSessionIds.filter((value): value is string => typeof value === "string") : undefined,
+          staleOnly: body.staleOnly === true,
+        });
+        return sendJson(response, 202, { job });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "";
+        if (/unavailable|disabled|not installed/i.test(message)) return sendProblem(response, 503, "organizer_unavailable", message);
+        throw error;
+      }
+    }
+    if (!options.organizer.organize) return sendProblem(response, 503, "organizer_unavailable", "Workspace organization is unavailable.");
     const existing = [...organizationJobs.values()].find((job) => job.scopeId === scopeId && job.status === "running");
     if (existing) return sendJson(response, 202, { job: projectOrganizationJob(existing) });
-    const job: OrganizationJob = {
+    const job: LegacyOrganizationJob = {
       id: randomUUID(), scopeId, controller: new AbortController(), startedAt: new Date().toISOString(), status: "running",
       progress: { phase: "titles", sessions: 0, titlesProcessed: 0, titlesGenerated: 0, relationshipsProcessed: 0, relationshipsGenerated: 0, warnings: 0 },
     };
@@ -372,10 +402,23 @@ async function handleApi(options: LocalWebServerOptions, request: IncomingMessag
   const organizeCancelMatch = url.pathname.match(/^\/api\/organize\/([^/]+)\/cancel$/);
   if (request.method === "POST" && organizeCancelMatch) {
     if (!sameOrigin(request)) return sendProblem(response, 403, "cross_origin_denied", "Workspace organization cancellation is available only to the local UI origin.");
-    const job = organizationJobs.get(decodePathPart(organizeCancelMatch[1]));
+    const jobId = decodePathPart(organizeCancelMatch[1]);
+    if (options.organizer?.cancel) return sendJson(response, 202, { job: options.organizer.cancel(jobId) });
+    const job = organizationJobs.get(jobId);
     if (!job) return sendProblem(response, 404, "organize_job_missing", "Workspace organization job was not found.");
     if (job.status === "running") job.controller.abort();
     return sendJson(response, 202, { job: projectOrganizationJob(job) });
+  }
+  const organizeActionMatch = url.pathname.match(/^\/api\/organize\/([^/]+)\/(pause|resume|retry)$/);
+  if (request.method === "POST" && organizeActionMatch) {
+    if (!sameOrigin(request)) return sendProblem(response, 403, "cross_origin_denied", "Workspace organization controls require the local UI origin.");
+    const organizer = options.organizer;
+    if (!organizer) return sendProblem(response, 503, "organizer_unavailable", "Workspace organization is unavailable.");
+    const id = decodePathPart(organizeActionMatch[1]);
+    const action = organizeActionMatch[2];
+    const job = action === "pause" ? organizer.pause?.(id) : action === "resume" ? organizer.resume?.(id) : organizer.retryFailed?.(id);
+    if (!job) return sendProblem(response, 404, "organize_job_missing", "Workspace organization job was not found.");
+    return sendJson(response, 202, { job });
   }
   if (request.method !== "GET" && request.method !== "HEAD") return sendProblem(response, 405, "method_not_allowed", "The local API is read-only.");
 
@@ -396,6 +439,14 @@ async function handleApi(options: LocalWebServerOptions, request: IncomingMessag
   }
 
   if (url.pathname === "/api/health") return sendJson(response, 200, { ok: true, upstreamPolicy: "read_only" });
+  const latestOrganizationMatch = url.pathname.match(/^\/api\/scopes\/([^/]+)\/organize\/latest$/);
+  if (latestOrganizationMatch) return sendJson(response, 200, { job: options.organizer?.latest?.(decodePathPart(latestOrganizationMatch[1])) });
+  const organizationItemsMatch = url.pathname.match(/^\/api\/organize\/([^/]+)\/items$/);
+  if (organizationItemsMatch) {
+    const items = options.organizer?.items?.(decodePathPart(organizationItemsMatch[1]));
+    if (!items) return sendProblem(response, 404, "organize_job_missing", "Workspace organization job was not found.");
+    return sendJson(response, 200, { items });
+  }
   if (url.pathname === "/api/events") {
     if (!provider.subscribeUpdates) return sendProblem(response, 501, "live_updates_unavailable", "This provider does not expose live updates.");
     response.statusCode = 200;
@@ -472,6 +523,8 @@ async function handleApi(options: LocalWebServerOptions, request: IncomingMessag
 
   const organizeStatusMatch = url.pathname.match(/^\/api\/organize\/([^/]+)$/);
   if (organizeStatusMatch) {
+    const progressive = options.organizer?.get?.(decodePathPart(organizeStatusMatch[1]));
+    if (progressive) return sendJson(response, 200, { job: progressive });
     const job = organizationJobs.get(decodePathPart(organizeStatusMatch[1]));
     if (!job) return sendProblem(response, 404, "organize_job_missing", "Workspace organization job was not found.");
     return sendJson(response, 200, { job: projectOrganizationJob(job) });
@@ -606,8 +659,9 @@ async function loadAllTurns(provider: LocalWebProvider, sessionId: string): Prom
   return turns;
 }
 
-async function runOrganizationJob(organizer: LocalWebOrganizer, job: OrganizationJob): Promise<void> {
+async function runOrganizationJob(organizer: LocalWebOrganizer, job: LegacyOrganizationJob): Promise<void> {
   try {
+    if (!organizer.organize) throw new Error("Legacy Organizer is unavailable.");
     const result = await organizer.organize(job.scopeId, {
       signal: job.controller.signal,
       onProgress: (progress) => { job.progress = progress; },
@@ -623,7 +677,7 @@ async function runOrganizationJob(organizer: LocalWebOrganizer, job: Organizatio
   }
 }
 
-function projectOrganizationJob(job: OrganizationJob): Readonly<Record<string, unknown>> {
+function projectOrganizationJob(job: LegacyOrganizationJob): Readonly<Record<string, unknown>> {
   return {
     id: job.id,
     scopeId: job.scopeId,

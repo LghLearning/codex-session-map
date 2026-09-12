@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { NativeLineage, SemanticGeneratorIdentity, Session } from "../../core/src/index.ts";
 import type { SemanticTraceCompletionClient, SemanticTraceCompletionRequest } from "./prompt-generator.ts";
+import { assertGenerationCommitAllowed, type SemanticGenerationOptions } from "./index.ts";
 
 export type SemanticParentRelation = "continuation" | "subtask" | "root";
 
@@ -35,7 +36,7 @@ export interface GeneratedSemanticParent {
 
 export interface SemanticParentGenerator {
   readonly identity: SemanticGeneratorIdentity;
-  generate(source: SemanticParentInferenceSource): Promise<GeneratedSemanticParent>;
+  generate(source: SemanticParentInferenceSource, options?: SemanticGenerationOptions): Promise<GeneratedSemanticParent>;
 }
 
 export interface SemanticParentEdge {
@@ -96,8 +97,8 @@ export class PromptSemanticParentGenerator implements SemanticParentGenerator {
     };
   }
 
-  async generate(source: SemanticParentInferenceSource): Promise<GeneratedSemanticParent> {
-    const request = buildSemanticParentRequest(source);
+  async generate(source: SemanticParentInferenceSource, options?: SemanticGenerationOptions): Promise<GeneratedSemanticParent> {
+    const request = { ...buildSemanticParentRequest(source), signal: options?.signal };
     const candidateIds = source.candidates.map((candidate) => candidate.projection.sessionId);
     const output = await this.#client.complete(request);
     try { return parseSemanticParentOutput(output, candidateIds); }
@@ -142,11 +143,11 @@ export class SemanticParentService {
     };
   }
 
-  async generate(source: SemanticParentInferenceSource, sessions: readonly Session[]): Promise<SemanticParentEdge> {
+  async generate(source: SemanticParentInferenceSource, sessions: readonly Session[], options?: SemanticGenerationOptions): Promise<SemanticParentEdge> {
     const key = `${source.current.providerId}\u0000${source.current.sessionId}`;
     const running = this.#inflight.get(key);
     if (running) return running;
-    const operation = this.#generate(source, sessions);
+    const operation = this.#generate(source, sessions, options);
     this.#inflight.set(key, operation);
     try { return await operation; }
     finally { this.#inflight.delete(key); }
@@ -177,10 +178,11 @@ export class SemanticParentService {
     return updated;
   }
 
-  async #generate(source: SemanticParentInferenceSource, sessions: readonly Session[]): Promise<SemanticParentEdge> {
+  async #generate(source: SemanticParentInferenceSource, sessions: readonly Session[], options?: SemanticGenerationOptions): Promise<SemanticParentEdge> {
     const generated = source.candidates.length
-      ? await this.#generator.generate(source)
+      ? await this.#generator.generate(source, options)
       : { relation: "root" as const, reason: "没有时间上更早且可比较的同 Workspace Session。" };
+    assertGenerationCommitAllowed(options);
     validateSemanticEdge(source.current.sessionId, generated.parentSessionId, generated.relation, sessions);
     await this.#assertAcyclic(source.current.providerId, source.current.sessionId, generated.parentSessionId, generated.relation);
     const previous = await this.#store.getSemanticParent(source.current.providerId, source.current.sessionId);

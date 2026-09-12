@@ -54,13 +54,14 @@ export class LocalOllamaCompletionClient implements SemanticTraceCompletionClien
 
   async complete(request: SemanticTraceCompletionRequest): Promise<string> {
     const format = request.responseJsonSchema ?? request.responseFormat;
-    const content = await this.#chat(request.system, request.input, format);
+    const content = await this.#chat(request.system, request.input, format, request.signal);
     if (content.length <= request.maxOutputCharacters) return content;
     const targetCharacterLimit = Math.min(180, request.maxOutputCharacters);
     const repaired = await this.#chat(
       `${request.system} The previous draft exceeded the hard limit. Compress it to at most ${targetCharacterLimit} characters without changing facts, certainty, subjects, objects, or key relations.`,
       JSON.stringify({ overlongDraft: content, targetCharacterLimit, hardCharacterLimit: request.maxOutputCharacters }),
       format,
+      request.signal,
     );
     if (repaired.length > request.maxOutputCharacters) {
       throw new LocalOllamaError("invalid_response", `Ollama exceeded the ${request.maxOutputCharacters}-character limit after one repair attempt.`);
@@ -68,7 +69,7 @@ export class LocalOllamaCompletionClient implements SemanticTraceCompletionClien
     return repaired;
   }
 
-  async #chat(system: string, input: string, responseFormat?: "json" | Readonly<Record<string, unknown>>): Promise<string> {
+  async #chat(system: string, input: string, responseFormat?: "json" | Readonly<Record<string, unknown>>, signal?: AbortSignal): Promise<string> {
     let response: Response;
     try {
       response = await this.#fetch(new URL("/api/chat", this.#endpoint), {
@@ -85,7 +86,7 @@ export class LocalOllamaCompletionClient implements SemanticTraceCompletionClien
           options: { temperature: 0, num_predict: responseFormat ? 320 : 160 },
           format: responseFormat,
         }),
-        signal: AbortSignal.timeout(this.#timeoutMs),
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(this.#timeoutMs)]) : AbortSignal.timeout(this.#timeoutMs),
       });
     } catch (error) {
       throw new LocalOllamaError("unavailable", `Local Ollama generation failed (${errorName(error)}).`);

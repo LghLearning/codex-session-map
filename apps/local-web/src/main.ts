@@ -24,7 +24,7 @@ import {
 } from "../../../packages/semantic-store/src/index.ts";
 import type { Session, Turn } from "../../../packages/core/src/index.ts";
 import { materializeSessionForest, projectSessionBranches, type BranchTurn } from "../../../packages/forest/src/index.ts";
-import { organizeWorkspace } from "../../../packages/organizer/src/index.ts";
+import { OrganizationRepository, ProgressiveOrganizationService, type OrganizationItem } from "../../../packages/organizer/src/index.ts";
 import { createLocalWebServer, type LocalWebEnvironment, type LocalWebForest, type LocalWebOrganizer, type LocalWebSemanticParents, type LocalWebSemanticTitles, type LocalWebSemanticTraces } from "./server.ts";
 import { WorkspaceSearchIndex } from "./search-index.ts";
 
@@ -43,8 +43,9 @@ const adapter = new CodexAdapterV1({
   appServerExecutable: valueAfter(args, "--codex-bin"),
 });
 const forestProjection = await createForestProjection(args);
-const semantic = await createSemanticPreview(args);
-const search = await createSearchIndex(args, semantic?.store);
+let search: WorkspaceSearchIndex | undefined;
+const semantic = await createSemanticPreview(args, (item) => search?.refreshSession(item.sessionId));
+search = await createSearchIndex(args, semantic?.store);
 const app = createLocalWebServer({
   provider: adapter,
   port,
@@ -53,7 +54,7 @@ const app = createLocalWebServer({
   semanticParents: semantic?.parents,
   userOverrides: semantic?.store,
   forest: forestProjection?.forest,
-  organizer: semantic?.generationAvailable ? semantic.organizer : undefined,
+  organizer: semantic?.organizer,
   search,
   semanticGenerationAvailable: semantic?.generationAvailable ?? false,
   environment: environmentStatus(args, semantic, forestProjection),
@@ -85,22 +86,25 @@ async function createSearchIndex(values: readonly string[], store?: SqliteSemant
   }
 }
 
-async function createSemanticPreview(values: readonly string[]): Promise<{ store: SqliteSemanticTraceStore; service: LocalWebSemanticTraces; titles: LocalWebSemanticTitles; parents: LocalWebSemanticParents; organizer: LocalWebOrganizer; generationAvailable: boolean; modelIdentity?: string; close(): Promise<void> } | undefined> {
+async function createSemanticPreview(values: readonly string[], onOrganizationCommit?: (item: OrganizationItem) => void): Promise<{ store: SqliteSemanticTraceStore; service: LocalWebSemanticTraces; titles: LocalWebSemanticTitles; parents: LocalWebSemanticParents; organizer: LocalWebOrganizer; generationAvailable: boolean; modelIdentity?: string; close(): Promise<void> } | undefined> {
   try {
     const databasePath = resolve(valueAfter(values, "--semantic-store") ?? ".codex-session-map/semantic-traces.sqlite");
     await mkdir(dirname(databasePath), { recursive: true });
-    let runtime: SemanticTraceCompletionClient;
+    const requestedModel = valueAfter(values, "--semantic-model") ?? DEFAULT_OLLAMA_MODEL;
+    let activeRuntime: SemanticTraceCompletionClient | undefined;
     let generationAvailable = false;
     try {
       if (values.includes("--no-semantic-traces")) throw new Error("Local AI generation was disabled by --no-semantic-traces.");
-      runtime = await LocalOllamaCompletionClient.connect({ model: valueAfter(values, "--semantic-model") ?? DEFAULT_OLLAMA_MODEL });
+      activeRuntime = await LocalOllamaCompletionClient.connect({ model: requestedModel });
       generationAvailable = true;
     } catch (error) {
       semanticUnavailableReason = error instanceof Error ? error.message : "Local AI is unavailable.";
       console.warn(`AI generation disabled; stored semantic data remains available: ${semanticUnavailableReason}`);
-      // This client can never generate. Store reads and user correction do not require Ollama.
-      runtime = { model: "unavailable", complete: async () => { throw new Error(semanticUnavailableReason); } };
     }
+    const runtime: SemanticTraceCompletionClient = activeRuntime ?? {
+      model: "unavailable",
+      complete: (request) => activeRuntime ? activeRuntime.complete(request) : Promise.reject(new Error(semanticUnavailableReason)),
+    };
     const store = new SqliteSemanticTraceStore(databasePath);
     const generator = new PromptTurnSemanticTraceGenerator({ client: runtime, promptVersion: "ollama-qwen3.5-v5-zh-preview" });
     const traceService = new TurnSemanticTraceService({ store, generator });
@@ -171,9 +175,50 @@ async function createSemanticPreview(values: readonly string[]): Promise<{ store
       } while (cursor);
       return turns;
     };
-    const generateParent = async (session: Session) => {
-      const context = await parentContext(session);
-      await parentService.generate(context.source, context.sessions);
+    const organizationDatabasePath = resolve(valueAfter(values, "--organization-store") ?? ".codex-session-map/organization.sqlite");
+    await mkdir(dirname(organizationDatabasePath), { recursive: true });
+    const organizationRepository = new OrganizationRepository(organizationDatabasePath);
+    const organizationService = new ProgressiveOrganizationService({
+      repository: organizationRepository,
+      port: {
+        listSessions: listAllSessions,
+        listTurns: listAllTurns,
+        inspectTrace: async (turn) => {
+          const lookup = await traceService.inspect(turn);
+          return { freshness: lookup.freshness, sourceFingerprint: lookup.currentInputFingerprint, strategyVersion: identity(generator.identity) };
+        },
+        generateTrace: async (turn, context) => { await traceService.ensure(turn, { signal: context.signal, mayCommit: context.mayCommit }); },
+        inspectTitle: async (session) => {
+          const lookup = await titleService.inspect(await titleSource(session, await listAllTurns(session.providerSessionId)));
+          return { freshness: lookup.freshness, sourceFingerprint: lookup.currentSourceFingerprint, strategyVersion: identity(titleGenerator.identity) };
+        },
+        generateTitle: async (session, context) => {
+          await titleService.generate(await titleSource(session, await listAllTurns(session.providerSessionId)), { signal: context.signal, mayCommit: context.mayCommit });
+        },
+        inspectParent: async (session) => {
+          const context = await parentContext(session);
+          const lookup = await parentService.inspect(context.source);
+          return { freshness: lookup.freshness, sourceFingerprint: lookup.currentSourceFingerprint, strategyVersion: identity(parentGenerator.identity) };
+        },
+        generateParent: async (session, execution) => {
+          const context = await parentContext(session);
+          await parentService.generate(context.source, context.sessions, { signal: execution.signal, mayCommit: execution.mayCommit });
+        },
+        onCommitted: onOrganizationCommit,
+      },
+    });
+    const ensureOrganizationRuntime = async () => {
+      if (generationAvailable) return;
+      if (values.includes("--no-semantic-traces")) throw new Error("AI organization unavailable: local generation was disabled by --no-semantic-traces.");
+      activeRuntime = await LocalOllamaCompletionClient.connect({ model: requestedModel });
+      generationAvailable = true;
+      for (const value of [generator.identity, titleGenerator.identity, parentGenerator.identity]) (value as { model?: string }).model = activeRuntime.model;
+    };
+    const organizer: LocalWebOrganizer = {
+      start: async (request) => { await ensureOrganizationRuntime(); return organizationService.start(request); },
+      get: (id) => organizationService.get(id), latest: (workspaceId) => organizationService.latest(workspaceId), items: (id) => organizationService.items(id),
+      pause: (id) => organizationService.pause(id), resume: (id) => organizationService.resume(id), cancel: (id) => organizationService.cancel(id),
+      retryFailed: (id) => organizationService.retryFailed(id), shutdown: () => organizationService.shutdown(),
     };
     return {
       store,
@@ -255,30 +300,18 @@ async function createSemanticPreview(values: readonly string[]): Promise<{ store
           };
         },
       },
-      organizer: {
-        organize: (scopeId, options) => organizeWorkspace({
-          scopeId,
-          signal: options.signal,
-          onProgress: options.onProgress,
-          port: {
-            listSessions: listAllSessions,
-            hasSemanticTitle: async (session) => Boolean(await store.getSessionTitle(session.providerId, session.providerSessionId)),
-            generateSemanticTitle: async (session) => {
-              const turns = await listAllTurns(session.providerSessionId);
-              await titleService.generate(await titleSource(session, turns));
-            },
-            hasSemanticParent: async (session) => Boolean(await store.getSemanticParent(session.providerId, session.providerSessionId)),
-            generateSemanticParent: generateParent,
-          },
-        }),
-      },
-      close: () => store.close(),
+      organizer,
+      close: async () => { await organizationService.shutdown(); organizationRepository.close(); await store.close(); },
     };
   } catch (error) {
     semanticUnavailableReason = error instanceof Error ? error.message : "Unknown local runtime error";
     console.warn(`Semantic generation disabled: ${semanticUnavailableReason}`);
     return undefined;
   }
+}
+
+function identity(value: { id: string; version: string; model?: string }): string {
+  return `${value.id}:${value.version}:${value.model ?? ""}`;
 }
 
 async function createForestProjection(values: readonly string[]): Promise<{ forest: LocalWebForest; databasePath: string; close(): Promise<void> } | undefined> {

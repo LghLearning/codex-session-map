@@ -61,9 +61,15 @@ export interface GeneratedSemanticSessionTitle {
   readonly title: string;
 }
 
+export interface SemanticGenerationOptions {
+  readonly signal?: AbortSignal;
+  /** Checked immediately before derived data is committed. */
+  readonly mayCommit?: () => boolean;
+}
+
 export interface SemanticSessionTitleGenerator {
   readonly identity: SemanticGeneratorIdentity;
-  generate(source: SemanticSessionTitleSource): Promise<GeneratedSemanticSessionTitle>;
+  generate(source: SemanticSessionTitleSource, options?: SemanticGenerationOptions): Promise<GeneratedSemanticSessionTitle>;
 }
 
 export interface SemanticSessionTitle {
@@ -94,7 +100,7 @@ export interface GeneratedSemanticTrace {
 
 export interface TurnSemanticTraceGenerator {
   readonly identity: SemanticGeneratorIdentity;
-  generate(turn: Turn): Promise<GeneratedSemanticTrace>;
+  generate(turn: Turn, options?: SemanticGenerationOptions): Promise<GeneratedSemanticTrace>;
 }
 
 export interface SemanticTraceStore extends DerivedStoreLifecycle, SemanticParentStore {
@@ -421,11 +427,11 @@ export class SemanticSessionTitleService {
     };
   }
 
-  async generate(source: SemanticSessionTitleSource): Promise<SemanticSessionTitle> {
+  async generate(source: SemanticSessionTitleSource, options?: SemanticGenerationOptions): Promise<SemanticSessionTitle> {
     const key = `${source.providerId}\u0000${source.sessionId}`;
     const running = this.#inflight.get(key);
     if (running) return running;
-    const operation = this.#generate(source);
+    const operation = this.#generate(source, options);
     this.#inflight.set(key, operation);
     try { return await operation; }
     finally { this.#inflight.delete(key); }
@@ -438,8 +444,9 @@ export class SemanticSessionTitleService {
     return title;
   }
 
-  async #generate(source: SemanticSessionTitleSource): Promise<SemanticSessionTitle> {
-    const generated = await this.#generator.generate(source);
+  async #generate(source: SemanticSessionTitleSource, options?: SemanticGenerationOptions): Promise<SemanticSessionTitle> {
+    const generated = await this.#generator.generate(source, options);
+    assertGenerationCommitAllowed(options);
     const previous = await this.#store.getSessionTitle(source.providerId, source.sessionId);
     const title: SemanticSessionTitle = {
       providerId: source.providerId,
@@ -479,28 +486,29 @@ export class TurnSemanticTraceService {
     };
   }
 
-  async ensure(turn: Turn): Promise<TurnSemanticTrace> {
-    return this.#runGeneration(turn, false);
+  async ensure(turn: Turn, options?: SemanticGenerationOptions): Promise<TurnSemanticTrace> {
+    return this.#runGeneration(turn, false, options);
   }
 
-  async regenerate(turn: Turn): Promise<TurnSemanticTrace> {
-    return this.#runGeneration(turn, true);
+  async regenerate(turn: Turn, options?: SemanticGenerationOptions): Promise<TurnSemanticTrace> {
+    return this.#runGeneration(turn, true, options);
   }
 
-  async #runGeneration(turn: Turn, force: boolean): Promise<TurnSemanticTrace> {
+  async #runGeneration(turn: Turn, force: boolean, options?: SemanticGenerationOptions): Promise<TurnSemanticTrace> {
     const key = `${turn.providerId}\u0000${turn.sessionId}\u0000${turn.nativeTurnId}`;
     const running = this.#inflight.get(key);
     if (running) return running;
-    const operation = this.#generateIfNeeded(turn, force);
+    const operation = this.#generateIfNeeded(turn, force, options);
     this.#inflight.set(key, operation);
     try { return await operation; }
     finally { this.#inflight.delete(key); }
   }
 
-  async #generateIfNeeded(turn: Turn, force: boolean): Promise<TurnSemanticTrace> {
+  async #generateIfNeeded(turn: Turn, force: boolean, options?: SemanticGenerationOptions): Promise<TurnSemanticTrace> {
     const lookup = await this.inspect(turn);
     if (!force && lookup.freshness === "current" && lookup.trace) return lookup.trace;
-    const generated = await this.#generator.generate(turn);
+    const generated = await this.#generator.generate(turn, options);
+    assertGenerationCommitAllowed(options);
     const trace: TurnSemanticTrace = {
       ...turnIdentity(turn),
       text: normalizeTraceText(generated.text),
@@ -511,6 +519,10 @@ export class TurnSemanticTraceService {
     await this.#store.put(trace);
     return trace;
   }
+}
+
+export function assertGenerationCommitAllowed(options?: SemanticGenerationOptions): void {
+  if (options?.signal?.aborted || options?.mayCommit?.() === false) throw new DOMException("Semantic result was discarded.", "AbortError");
 }
 
 export interface SessionTraceIndexResult {
