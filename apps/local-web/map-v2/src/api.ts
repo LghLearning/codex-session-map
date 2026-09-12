@@ -11,6 +11,16 @@ export interface Bootstrap {
   search?: { available: boolean; mode: string };
 }
 
+export type OrganizationMode = "quick" | "full";
+export type OrganizationStatus = "queued" | "running" | "pausing" | "paused" | "canceling" | "canceled" | "completed" | "completed_with_failures" | "interrupted" | "failed";
+export interface OrganizationJobView {
+  id: string; workspaceId: string; mode: OrganizationMode; sessionId?: string; status: OrganizationStatus;
+  createdAt: string; startedAt?: string; updatedAt: string; completedAt?: string; error?: string;
+  lastCommitted?: { sessionId: string; nativeTurnId?: string; operation: "trace" | "title" | "parent"; completedAt?: string };
+  counts: { planned: number; queued: number; running: number; generated: number; reused: number; failed: number; canceled: number; stale: number; byOperation: Record<"trace" | "title" | "parent", { planned: number; completed: number; generated: number; reused: number; failed: number }> };
+}
+export interface OrganizationItemView { id: string; sessionId: string; nativeTurnId?: string; operation: "trace" | "title" | "parent"; status: string; attempts: number; errorCode?: string; error?: string }
+
 export async function getBootstrap(signal?: AbortSignal): Promise<Bootstrap> { return api("/api/bootstrap", { signal }); }
 export async function getForest(workspace: string, signal?: AbortSignal): Promise<MapForest> {
   return (await api(`/api/scopes/${encodeURIComponent(workspace)}/forest?branches=0`, { signal })).forest;
@@ -67,10 +77,15 @@ export async function latestEdit(workspace: string): Promise<any> { return (awai
 export async function undoEdit(editId: string, revision: number): Promise<any> {
   return (await api(`/api/user-edits/${encodeURIComponent(editId)}/undo`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ revision }) })).edit;
 }
-export async function startOrganization(workspace: string): Promise<any> {
-  return (await api(`/api/scopes/${encodeURIComponent(workspace)}/organize`, { method: "POST" })).job;
+export async function startOrganization(workspace: string, options: { mode: OrganizationMode; sessionId?: string; selectedSessionId?: string; expandedSessionIds?: readonly string[]; staleOnly?: boolean }): Promise<OrganizationJobView> {
+  return (await api(`/api/scopes/${encodeURIComponent(workspace)}/organize`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(options) })).job;
 }
-export async function getOrganization(jobId: string): Promise<any> { return (await api(`/api/organize/${encodeURIComponent(jobId)}`)).job; }
+export async function getOrganization(jobId: string): Promise<OrganizationJobView> { return (await api(`/api/organize/${encodeURIComponent(jobId)}`)).job; }
+export async function getLatestOrganization(workspace: string): Promise<OrganizationJobView | undefined> { return (await api(`/api/scopes/${encodeURIComponent(workspace)}/organize/latest`)).job; }
+export async function controlOrganization(jobId: string, action: "pause" | "resume" | "cancel" | "retry"): Promise<OrganizationJobView> {
+  return (await api(`/api/organize/${encodeURIComponent(jobId)}/${action}`, { method: "POST" })).job;
+}
+export async function getOrganizationItems(jobId: string): Promise<OrganizationItemView[]> { return (await api(`/api/organize/${encodeURIComponent(jobId)}/items`)).items; }
 
 async function api(path: string, options: RequestInit = {}): Promise<any> {
   const response = await fetch(path, { ...options, headers: { Accept: "application/json", ...(options.headers ?? {}) } });

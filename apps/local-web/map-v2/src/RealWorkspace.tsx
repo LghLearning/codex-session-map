@@ -1,6 +1,6 @@
 import { Background, Controls, MiniMap, ReactFlow, useNodesState, useReactFlow, type Connection, type NodeMouseHandler, type Viewport } from "@xyflow/react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { getBootstrap, getForest, getManualParents, getOrganization, getOverride, getSessionDetail, getTurnDetail, getTurnDirectory, latestEdit, startOrganization, undoEdit, writeOverride, writePlacement, type Bootstrap } from "./api.ts";
+import { getBootstrap, getForest, getManualParents, getOverride, getSessionDetail, getTurnDetail, getTurnDirectory, latestEdit, undoEdit, writeOverride, writePlacement, type Bootstrap } from "./api.ts";
 import { buildMapGraph, flattenSessions } from "./graph.ts";
 import { SectionNode, SessionNode, TurnNode } from "./nodes.tsx";
 import { connectionToPlacement, type PlacementDraft } from "./placement.ts";
@@ -10,6 +10,7 @@ import { SearchPanel } from "./search/SearchPanel.tsx";
 import { useWorkspaceSearch } from "./search/useWorkspaceSearch.ts";
 import { resolveSearchNavigation } from "./search/navigation.ts";
 import { TurnReader } from "./reader/TurnReader.tsx";
+import { OrganizationControl } from "./organization/OrganizationControl.tsx";
 
 const nodeTypes = { session: SessionNode, turn: TurnNode, section: SectionNode };
 const MAX_EXPANDED = 12;
@@ -39,7 +40,6 @@ export default function RealWorkspace() {
   const [lastEdit, setLastEdit] = useState<any>();
   const [forestError, setForestError] = useState("");
   const [loading, setLoading] = useState(true);
-  const [organizing, setOrganizing] = useState(false);
   const search = useWorkspaceSearch(workspace, Boolean(bootstrap?.search?.available));
 
   const reloadForest = useCallback(async (targetWorkspace: string, signal?: AbortSignal) => {
@@ -234,23 +234,6 @@ export default function RealWorkspace() {
       setDetail(selection.kind === "turn" ? await getTurnDetail(selection.sessionId, selection.nativeTurnId) : await getSessionDetail(selection.sessionId));
     } catch (error) { setNotice((error as Error).message); }
   }
-  async function organize() {
-    if (!bootstrap?.organizer?.available || organizing) return;
-    setOrganizing(true); setNotice("Organizing Workspace…");
-    try {
-      let job = await startOrganization(workspace);
-      while (job.status === "running") {
-        await new Promise((resolve) => setTimeout(resolve, 500));
-        job = await getOrganization(job.id);
-        setNotice(`Organizing · Titles ${job.progress?.titlesProcessed ?? 0}/${job.progress?.sessions ?? 0} · Relationships ${job.progress?.relationshipsProcessed ?? 0}/${job.progress?.sessions ?? 0}`);
-      }
-      if (job.status !== "completed") throw new Error(job.error ?? `Organization ${job.status}.`);
-      setNotice("Workspace organized"); await reloadForest(workspace);
-      await Promise.allSettled([...expanded].map((sessionId) => reloadTurnDirectory(sessionId)));
-    } catch (error) { setNotice((error as Error).message); }
-    finally { setOrganizing(false); }
-  }
-
   const sessions = forest ? flattenSessions([...forest.roots, ...forest.unorganized]) : [];
   const selectedNode = selection ? sessions.find((session) => session.sessionId === selection.sessionId) : undefined;
   const legacyPath = selection?.kind === "turn"
@@ -264,7 +247,7 @@ export default function RealWorkspace() {
       <select aria-label="Workspace" value={workspace} onChange={(event) => void switchWorkspace(event.target.value)}>{bootstrap?.scopes.map((scope) => <option key={scope.id} value={scope.id}>{scope.displayName}</option>)}</select>
       <SearchPanel query={search.query} setQuery={search.setQuery} results={search.page?.results ?? []} index={search.index} loading={search.loading} error={search.error} nextCursor={search.page?.nextCursor} loadMore={() => void search.loadMore()} onSelect={selectSearchResult} />
       <div className="view-tabs"><button className="active" type="button">Map</button><a href={legacyHref}>List</a></div>
-      <button type="button" className="subtle" disabled={!bootstrap?.organizer?.available || organizing} title={bootstrap?.organizer?.available ? "Organize this Workspace" : "AI generation unavailable"} onClick={() => void organize()}>{organizing ? "Organizing…" : "Organize"}</button>
+      <OrganizationControl workspace={workspace} available={Boolean(bootstrap?.organizer?.available)} selectedSessionId={selection?.sessionId} expandedSessionIds={[...expanded]} onNotice={setNotice} onProgress={(item) => { if (item?.operation === "trace") { if (expandedRef.current.has(item.sessionId)) void reloadTurnDirectory(item.sessionId).catch(() => undefined); } else void reloadForest(workspace); }} />
       <button type="button" className="subtle" onClick={() => void performUndo()}>Undo</button>
     </header>
     <aside className="workspace-rail">
