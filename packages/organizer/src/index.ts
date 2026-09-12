@@ -1,5 +1,9 @@
 import type { Session } from "../../core/src/index.ts";
 
+export * from "./types.ts";
+export * from "./repository.ts";
+export * from "./progressive.ts";
+
 export interface WorkspaceOrganizationPort {
   listSessions(scopeId: string): Promise<readonly Session[]>;
   hasSemanticTitle(session: Session): Promise<boolean>;
