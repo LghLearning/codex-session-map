@@ -1,0 +1,48 @@
+{
+  "protocol": "v0.2-f-structural-v1",
+  "kind": "SYNTHETIC_FIXTURE",
+  "measuredAt": "2026-09-13T08:44:16.118Z",
+  "environment": {
+    "platform": "win32",
+    "arch": "x64",
+    "node": "24.19.0"
+  },
+  "fixture": {
+    "sessionSizes": [
+      50,
+      100,
+      500
+    ],
+    "turnsPerSession": 3,
+    "longSessionTurns": [
+      10,
+      100,
+      500
+    ],
+    "samplesPerPureProjection": 5
+  },
+  "results": {
+    "forest_50_sessions_ms": 0.05160000000000764,
+    "graph_50_sessions_ms": 0.13930000000000575,
+    "forest_100_sessions_ms": 0.109800000000007,
+    "graph_100_sessions_ms": 0.13230000000000075,
+    "forest_500_sessions_ms": 0.2563999999999993,
+    "graph_500_sessions_ms": 0.5353000000000065,
+    "turn_directory_10_turns_ms": 0.0007000000000090267,
+    "expanded_graph_10_turns_ms": 0.007199999999997431,
+    "turn_directory_100_turns_ms": 0.00549999999999784,
+    "expanded_graph_100_turns_ms": 0.04829999999999757,
+    "turn_directory_500_turns_ms": 0.004699999999999704,
+    "expanded_graph_500_turns_ms": 0.055999999999997385,
+    "search_initial_50_sessions_ms": 27.2222,
+    "search_reconcile_50_sessions_ms": 46.748099999999994,
+    "search_initial_100_sessions_ms": 30.08790000000002,
+    "search_reconcile_100_sessions_ms": 146.1456,
+    "search_initial_500_sessions_ms": 97.65069999999997,
+    "search_reconcile_500_sessions_ms": 2266.2785000000003,
+    "organizer_full_100_sessions_ms": 422.1896999999999,
+    "organizer_planning_100_sessions_ms": 6.708700000000135,
+    "organizer_provider_session_reads": 1501,
+    "organizer_provider_turn_reads": 1000
+  }
+}
