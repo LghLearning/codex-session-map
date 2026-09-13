@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
-import type { Session, SessionProvider, Turn } from "../../../packages/core/src/index.ts";
+import type { Session, SessionProvider, SessionProviderUpdate, Turn } from "../../../packages/core/src/index.ts";
 import { preferredSessionDisplayTitle, semanticInputFingerprint, type SqliteSemanticTraceStore } from "../../../packages/semantic-store/src/index.ts";
 
 export type SearchSourceKind = "session_title" | "turn_label" | "turn_summary" | "user_input" | "assistant_final";
@@ -39,8 +39,17 @@ export interface WorkspaceSearchPort {
   status(workspaceId: string): SearchIndexStatus;
   query(workspaceId: string, query: string, options?: { limit?: number; cursor?: string; sourceKinds?: readonly SearchSourceKind[] }): WorkspaceSearchPage;
   refreshSession(sessionId: string): void;
+  removeSessionDocuments(sessionId: string): void;
+  reconcileUpdate(update: SessionProviderUpdate): void;
   reconcile(): void;
   close(): Promise<void>;
+}
+
+export interface SearchIndexDiagnostics {
+  readonly fullReconciliations: number;
+  readonly refreshedSessions: number;
+  readonly skippedSessions: number;
+  readonly removedSessions: number;
 }
 
 interface SearchSemanticSource {
@@ -57,6 +66,7 @@ export class WorkspaceSearchIndex implements WorkspaceSearchPort {
   readonly #running = new Map<string, Promise<void>>();
   readonly #started = new Set<string>();
   readonly #refreshing = new Set<Promise<unknown>>();
+  readonly #diagnostics = { fullReconciliations: 0, refreshedSessions: 0, skippedSessions: 0, removedSessions: 0 };
 
   constructor(options: { databasePath?: string; provider: SessionProvider; semantic?: SearchSemanticSource }) {
     this.#provider = options.provider;
@@ -91,6 +101,12 @@ export class WorkspaceSearchIndex implements WorkspaceSearchPort {
         updated_at TEXT,
         error TEXT
       );
+      CREATE TABLE IF NOT EXISTS search_session_state (
+        session_id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        source_fingerprint TEXT NOT NULL,
+        indexed_turns INTEGER NOT NULL
+      );
     `);
   }
 
@@ -105,6 +121,8 @@ export class WorkspaceSearchIndex implements WorkspaceSearchPort {
     if (!row) return { state: "idle", totalSessions: 0, indexedSessions: 0, indexedTurns: 0, coverage: 0 };
     return projectStatus(row);
   }
+
+  diagnostics(): SearchIndexDiagnostics { return { ...this.#diagnostics }; }
 
   query(workspaceId: string, rawQuery: string, options: { limit?: number; cursor?: string; sourceKinds?: readonly SearchSourceKind[] } = {}): WorkspaceSearchPage {
     this.start(workspaceId);
@@ -128,8 +146,17 @@ export class WorkspaceSearchIndex implements WorkspaceSearchPort {
   }
 
   refreshSession(sessionId: string): void {
-    const task = this.#provider.readSession(sessionId).then((session) => this.#indexSession(session)).catch(() => undefined).finally(() => this.#refreshing.delete(task));
+    const task = this.#provider.readSession(sessionId).then((session) => this.#indexSession(session)).catch(() => this.removeSessionDocuments(sessionId)).finally(() => this.#refreshing.delete(task));
     this.#refreshing.add(task);
+  }
+
+  removeSessionDocuments(sessionId: string): void { this.#diagnostics.removedSessions += 1; this.#deleteSession(undefined, sessionId); }
+
+  reconcileUpdate(update: SessionProviderUpdate): void {
+    const scoped = update.affectedSessionIds !== undefined || update.deletedSessionIds !== undefined;
+    if (!scoped) return this.reconcile();
+    for (const sessionId of update.deletedSessionIds ?? []) this.removeSessionDocuments(sessionId);
+    for (const sessionId of update.affectedSessionIds ?? []) this.refreshSession(sessionId);
   }
 
   reconcile(): void { for (const workspaceId of this.#started) this.#schedule(workspaceId); }
@@ -143,6 +170,7 @@ export class WorkspaceSearchIndex implements WorkspaceSearchPort {
   }
 
   async #build(workspaceId: string): Promise<void> {
+    this.#diagnostics.fullReconciliations += 1;
     const existing = this.status(workspaceId);
     this.#writeStatus(workspaceId, { ...existing, state: "indexing", error: undefined });
     try {
@@ -188,14 +216,21 @@ export class WorkspaceSearchIndex implements WorkspaceSearchPort {
       if (turn.input.text) documents.push({ ...common, docId: documentId(session.providerSessionId, turn.nativeTurnId, "user_input"), sourceKind: "user_input", text: turn.input.text });
       if (turn.assistantFinal) documents.push({ ...common, docId: documentId(session.providerSessionId, turn.nativeTurnId, "assistant_final"), sourceKind: "assistant_final", text: turn.assistantFinal });
     }
+    const sourceFingerprint = fingerprint(documents.map((document) => `${document.docId}\0${normalizeText(document.text)}`).join("\n"));
+    const current = this.#db.prepare("SELECT source_fingerprint,indexed_turns FROM search_session_state WHERE session_id=?").get(session.providerSessionId) as { source_fingerprint: string; indexed_turns: number } | undefined;
+    if (current?.source_fingerprint === sourceFingerprint) { this.#diagnostics.skippedSessions += 1; return current.indexed_turns; }
     this.#replaceSession(session.workspaceScopeId, session.providerSessionId, documents);
+    this.#diagnostics.refreshedSessions += 1;
+    this.#db.prepare(`INSERT INTO search_session_state(session_id,workspace_id,source_fingerprint,indexed_turns) VALUES(?,?,?,?)
+      ON CONFLICT(session_id) DO UPDATE SET workspace_id=excluded.workspace_id,source_fingerprint=excluded.source_fingerprint,indexed_turns=excluded.indexed_turns`)
+      .run(session.providerSessionId, session.workspaceScopeId, sourceFingerprint, turns.length);
     return turns.length;
   }
 
   #replaceSession(workspaceId: string, sessionId: string, documents: readonly SearchDocument[]): void {
     this.#db.exec("BEGIN IMMEDIATE");
     try {
-      this.#deleteSession(workspaceId, sessionId);
+      this.#deleteSession(undefined, sessionId);
       const insert = this.#db.prepare(`INSERT INTO search_documents
         (doc_id,workspace_id,session_id,native_turn_id,display_ordinal,session_title,source_kind,source_timestamp,normalized_text,source_fingerprint)
         VALUES (?,?,?,?,?,?,?,?,?,?)`);
@@ -210,11 +245,15 @@ export class WorkspaceSearchIndex implements WorkspaceSearchPort {
     } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
   }
 
-  #deleteSession(workspaceId: string, sessionId: string): void {
-    const ids = this.#db.prepare("SELECT doc_id FROM search_documents WHERE workspace_id=? AND session_id=?").all(workspaceId, sessionId) as unknown as { doc_id: string }[];
+  #deleteSession(workspaceId: string | undefined, sessionId: string): void {
+    const ids = (workspaceId
+      ? this.#db.prepare("SELECT doc_id FROM search_documents WHERE workspace_id=? AND session_id=?").all(workspaceId, sessionId)
+      : this.#db.prepare("SELECT doc_id FROM search_documents WHERE session_id=?").all(sessionId)) as unknown as { doc_id: string }[];
     const removeFts = this.#db.prepare("DELETE FROM search_documents_fts WHERE doc_id=?");
     for (const row of ids) removeFts.run(row.doc_id);
-    this.#db.prepare("DELETE FROM search_documents WHERE workspace_id=? AND session_id=?").run(workspaceId, sessionId);
+    if (workspaceId) this.#db.prepare("DELETE FROM search_documents WHERE workspace_id=? AND session_id=?").run(workspaceId, sessionId);
+    else this.#db.prepare("DELETE FROM search_documents WHERE session_id=?").run(sessionId);
+    this.#db.prepare("DELETE FROM search_session_state WHERE session_id=?").run(sessionId);
   }
 
   #ftsResults(workspaceId: string, query: string, kinds: readonly SearchSourceKind[], limit: number, offset: number): WorkspaceSearchResult[] {

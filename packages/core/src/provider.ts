@@ -30,6 +30,9 @@ export interface SessionProviderUpdate {
   readonly revision: number;
   readonly reason: "provider_notification" | "source_change" | "periodic_reconciliation";
   readonly occurredAt: string;
+  /** Present only when the provider can prove the affected scope. */
+  readonly affectedSessionIds?: readonly string[];
+  readonly deletedSessionIds?: readonly string[];
 }
 
 /** Optional capability; consumers must still reconcile at startup. */

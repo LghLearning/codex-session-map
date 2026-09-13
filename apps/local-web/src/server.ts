@@ -250,7 +250,7 @@ async function handleApi(options: LocalWebServerOptions, request: IncomingMessag
         await validateTurnAnchor(provider, session, value.parentSessionId, value.anchorTurnId);
       }
       edit = store.overrides.write(key, session.workspaceScopeId, value, requireRevision(body.revision), sessions);
-      options.search?.refreshSession(session.providerSessionId);
+      if (field !== "parent") options.search?.refreshSession(session.providerSessionId);
     }
     const override = store.overrides.read(key) ?? { ...key, value: null, revision: 0 };
     return sendJson(response, 200, {
@@ -457,7 +457,7 @@ async function handleApi(options: LocalWebServerOptions, request: IncomingMessag
     eventResponses.add(response);
     response.write("event: ready\ndata: {}\n\n");
     const unsubscribe = await provider.subscribeUpdates((update) => {
-      options.search?.reconcile();
+      options.search?.reconcileUpdate(update);
       if (!response.destroyed) response.write(`event: snapshot\ndata: ${JSON.stringify(update)}\n\n`);
     });
     const heartbeat = setInterval(() => { if (!response.destroyed) response.write(": keep-alive\n\n"); }, 15_000);

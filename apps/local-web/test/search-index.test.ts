@@ -58,6 +58,29 @@ test("refreshSession replaces stale documents after a user override", async (t) 
   assert.equal(index.query("workspace-a", "Assistant final").results.length, 0, "stale source documents are replaced");
 });
 
+test("scoped provider updates skip unchanged Sessions, refresh changes, delete documents, and retain full fallback", async (t) => {
+  const provider = new FixtureProvider();
+  const index = new WorkspaceSearchIndex({ provider });
+  t.after(async () => index.close());
+  index.start("workspace-a"); await ready(index, "workspace-a");
+
+  const initial = index.diagnostics();
+  index.reconcileUpdate({ revision: 1, reason: "source_change", occurredAt: new Date().toISOString(), affectedSessionIds: ["session-a"] });
+  await eventually(() => index.diagnostics().skippedSessions > initial.skippedSessions);
+
+  provider.turns.set("session-a", [{ ...provider.turns.get("session-a")![0], assistantFinal: "targeted-source-change" }]);
+  index.reconcileUpdate({ revision: 2, reason: "source_change", occurredAt: new Date().toISOString(), affectedSessionIds: ["session-a"] });
+  await eventually(() => index.query("workspace-a", "targeted-source-change").results.length === 1);
+
+  index.reconcileUpdate({ revision: 3, reason: "source_change", occurredAt: new Date().toISOString(), deletedSessionIds: ["session-a"] });
+  assert.equal(index.query("workspace-a", "targeted-source-change").results.length, 0);
+  assert.ok(index.diagnostics().removedSessions > 0);
+
+  const fullBefore = index.diagnostics().fullReconciliations;
+  index.reconcileUpdate({ revision: 4, reason: "periodic_reconciliation", occurredAt: new Date().toISOString() });
+  await eventually(() => index.diagnostics().fullReconciliations > fullBefore);
+});
+
 test("scope-safe search API returns navigation payload without transcripts", async (t) => {
   const provider = new FixtureProvider();
   const index = new WorkspaceSearchIndex({ provider });
@@ -74,11 +97,12 @@ test("scope-safe search API returns navigation payload without transcripts", asy
 });
 
 class FixtureProvider implements SessionProvider {
+  readonly sessions = sessions.map((value) => ({ ...value }));
   readonly turns = new Map([...turns].map(([sessionId, values]) => [sessionId, values.map((value) => ({ ...value }))]));
   async getCapabilities(): Promise<SessionProviderCapabilities> { return { nativeLineage: "none", openSession: false, openTurn: false, liveUpdates: false, titleRead: true, titleWrite: false, archiveRead: true }; }
   async listWorkspaceScopes(): Promise<readonly WorkspaceScope[]> { return scopes; }
-  async listSessions(workspaceId: string): Promise<Page<Session>> { return { data: sessions.filter((item) => item.workspaceScopeId === workspaceId) }; }
-  async readSession(sessionId: string): Promise<Session> { const value = sessions.find((item) => item.providerSessionId === sessionId); if (!value) throw new Error("missing"); return value; }
+  async listSessions(workspaceId: string): Promise<Page<Session>> { return { data: this.sessions.filter((item) => item.workspaceScopeId === workspaceId) }; }
+  async readSession(sessionId: string): Promise<Session> { const value = this.sessions.find((item) => item.providerSessionId === sessionId); if (!value) throw new Error("missing"); return value; }
   async listTurns(sessionId: string): Promise<Page<Turn>> { return { data: this.turns.get(sessionId) ?? [] }; }
   async getNativeLineage(): Promise<NativeLineage | null> { return null; }
 }

@@ -220,17 +220,35 @@ export class CodexAdapterV1 implements SessionProvider, LiveSessionProvider {
 
   async #handleInvalidation(reason: SourceInvalidationReason): Promise<void> {
     try {
+      const previous = this.#state;
       await this.refresh();
+      const scope = previous && this.#state ? changedSessions(previous, this.#state) : undefined;
       const update: SessionProviderUpdate = {
         revision: ++this.#revision,
         reason,
         occurredAt: new Date().toISOString(),
+        ...(scope?.affected.length ? { affectedSessionIds: scope.affected } : {}),
+        ...(scope?.deleted.length ? { deletedSessionIds: scope.deleted } : {}),
       };
       for (const listener of this.#updateListeners) listener(update);
     } catch (error) {
       this.#diagnostics.add({ code: "live_update_unavailable", severity: "warning", message: `Read-only reconciliation failed; the previous UI snapshot remains usable (${errorName(error)}).` });
     }
   }
+}
+
+function changedSessions(before: MaterializedState, after: MaterializedState): { affected: string[]; deleted: string[] } | undefined {
+  const affected: string[] = [];
+  const deleted = [...before.sessions.keys()].filter((id) => !after.sessions.has(id));
+  for (const [id, session] of after.sessions) {
+    const previous = before.sessions.get(id);
+    if (!previous || sourceStateFingerprint(previous, before.records.get(id)) !== sourceStateFingerprint(session, after.records.get(id))) affected.push(id);
+  }
+  return affected.length || deleted.length ? { affected, deleted } : undefined;
+}
+
+function sourceStateFingerprint(session: Session, record?: CodexThreadRecord): string {
+  return createHash("sha256").update(JSON.stringify({ session, record })).digest("hex");
 }
 
 function mergeSnapshots(snapshots: readonly SourceSnapshot[], diagnostics: DiagnosticCollector): Map<string, CodexThreadRecord> {
