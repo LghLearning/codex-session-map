@@ -100,15 +100,33 @@ export class PromptSemanticParentGenerator implements SemanticParentGenerator {
   async generate(source: SemanticParentInferenceSource, options?: SemanticGenerationOptions): Promise<GeneratedSemanticParent> {
     const request = { ...buildSemanticParentRequest(source), signal: options?.signal };
     const candidateIds = source.candidates.map((candidate) => candidate.projection.sessionId);
-    const output = await this.#client.complete(request);
-    try { return parseSemanticParentOutput(output, candidateIds); }
-    catch (error) {
-      if (!(error instanceof Error) || !/generator returned malformed JSON/.test(error.message)) throw error;
-      const retry = await this.#client.complete({
-        ...request,
-        system: `${request.system} 上一次输出不是合法 JSON。不要分析、复述或使用 Markdown；这次必须只输出一个符合指定 schema 的 JSON 对象。`,
-      });
-      return parseSemanticParentOutput(retry, candidateIds);
+    let modelMs = 0;
+    let validationMs = 0;
+    let retryCount = 0;
+    const complete = async (value: typeof request): Promise<string> => {
+      const started = performance.now();
+      try { return await this.#client.complete(value); }
+      finally { modelMs += performance.now() - started; }
+    };
+    const parse = (value: string) => {
+      const started = performance.now();
+      try { return parseSemanticParentOutput(value, candidateIds); }
+      finally { validationMs += performance.now() - started; }
+    };
+    try {
+      const output = await complete(request);
+      try { return parse(output); }
+      catch (error) {
+        if (!(error instanceof Error) || !/generator returned malformed JSON/.test(error.message)) throw error;
+        retryCount = 1;
+        const retry = await complete({
+          ...request,
+          system: `${request.system} 上一次输出不是合法 JSON。不要分析、复述或使用 Markdown；这次必须只输出一个符合指定 schema 的 JSON 对象。`,
+        });
+        return parse(retry);
+      }
+    } finally {
+      options?.onMetrics?.({ inputChars: request.system.length + request.input.length, modelMs, validationMs, retryCount });
     }
   }
 }
@@ -183,6 +201,7 @@ export class SemanticParentService {
       ? await this.#generator.generate(source, options)
       : { relation: "root" as const, reason: "没有时间上更早且可比较的同 Workspace Session。" };
     assertGenerationCommitAllowed(options);
+    const validationStarted = performance.now();
     validateSemanticEdge(source.current.sessionId, generated.parentSessionId, generated.relation, sessions);
     await this.#assertAcyclic(source.current.providerId, source.current.sessionId, generated.parentSessionId, generated.relation);
     const previous = await this.#store.getSemanticParent(source.current.providerId, source.current.sessionId);
@@ -200,7 +219,10 @@ export class SemanticParentService {
       userRelation: previous?.userRelation,
       userReviewedAt: previous?.userReviewedAt,
     };
+    options?.onMetrics?.({ validationMs: performance.now() - validationStarted });
+    const commitStarted = performance.now();
     await this.#store.putGeneratedSemanticParent(edge);
+    options?.onMetrics?.({ commitMs: performance.now() - commitStarted });
     return (await this.#store.getSemanticParent(source.current.providerId, source.current.sessionId))!;
   }
 

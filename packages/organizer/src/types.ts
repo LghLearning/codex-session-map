@@ -28,6 +28,8 @@ export interface OrganizationJob {
   readonly requestedBy: string;
   readonly runToken: number;
   readonly error?: string;
+  readonly planningMs: number;
+  readonly snapshotPreparationMs: number;
   readonly counts: OrganizationCounts;
   readonly lastCommitted?: Pick<OrganizationItem, "sessionId" | "nativeTurnId" | "operation" | "completedAt">;
 }
@@ -68,7 +70,19 @@ export interface OrganizationItem {
   readonly error?: string;
   readonly startedAt?: string;
   readonly completedAt?: string;
+  readonly metrics: OrganizationItemMetrics;
 }
+
+export interface OrganizationItemMetrics {
+  readonly queueMs: number;
+  readonly inputChars: number;
+  readonly modelMs: number;
+  readonly validationMs: number;
+  readonly commitMs: number;
+  readonly retryCount: number;
+}
+
+export type OrganizationMetricDelta = Partial<OrganizationItemMetrics>;
 
 export type OrganizationErrorCode = "model_unavailable" | "model_timeout" | "generation_invalid" | "semantic_validation" | "source_changed" | "dependency_unavailable" | "storage_failure" | "canceled" | "unknown";
 
@@ -82,6 +96,7 @@ export interface OrganizationExecutionContext {
   readonly signal: AbortSignal;
   readonly expectedFingerprint: string;
   readonly mayCommit: () => boolean;
+  readonly recordMetrics: (metrics: OrganizationMetricDelta) => void;
 }
 
 export interface ProgressiveOrganizationPort {

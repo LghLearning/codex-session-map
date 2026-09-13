@@ -65,6 +65,15 @@ export interface SemanticGenerationOptions {
   readonly signal?: AbortSignal;
   /** Checked immediately before derived data is committed. */
   readonly mayCommit?: () => boolean;
+  readonly onMetrics?: (metrics: SemanticGenerationMetrics) => void;
+}
+
+export interface SemanticGenerationMetrics {
+  readonly inputChars?: number;
+  readonly modelMs?: number;
+  readonly validationMs?: number;
+  readonly commitMs?: number;
+  readonly retryCount?: number;
 }
 
 export interface SemanticSessionTitleGenerator {
@@ -447,6 +456,7 @@ export class SemanticSessionTitleService {
   async #generate(source: SemanticSessionTitleSource, options?: SemanticGenerationOptions): Promise<SemanticSessionTitle> {
     const generated = await this.#generator.generate(source, options);
     assertGenerationCommitAllowed(options);
+    const validationStarted = performance.now();
     const previous = await this.#store.getSessionTitle(source.providerId, source.sessionId);
     const title: SemanticSessionTitle = {
       providerId: source.providerId,
@@ -458,7 +468,10 @@ export class SemanticSessionTitleService {
       generatedAt: this.#now().toISOString(),
       userEditedAt: previous?.userEditedAt,
     };
+    options?.onMetrics?.({ validationMs: performance.now() - validationStarted });
+    const commitStarted = performance.now();
     await this.#store.putGeneratedSessionTitle(title);
+    options?.onMetrics?.({ commitMs: performance.now() - commitStarted });
     return (await this.#store.getSessionTitle(source.providerId, source.sessionId))!;
   }
 }
@@ -509,6 +522,7 @@ export class TurnSemanticTraceService {
     if (!force && lookup.freshness === "current" && lookup.trace) return lookup.trace;
     const generated = await this.#generator.generate(turn, options);
     assertGenerationCommitAllowed(options);
+    const validationStarted = performance.now();
     const trace: TurnSemanticTrace = {
       ...turnIdentity(turn),
       text: normalizeTraceText(generated.text),
@@ -516,7 +530,10 @@ export class TurnSemanticTraceService {
       generator: { ...this.#generator.identity },
       generatedAt: this.#now().toISOString(),
     };
+    options?.onMetrics?.({ validationMs: performance.now() - validationStarted });
+    const commitStarted = performance.now();
     await this.#store.put(trace);
+    options?.onMetrics?.({ commitMs: performance.now() - commitStarted });
     return trace;
   }
 }

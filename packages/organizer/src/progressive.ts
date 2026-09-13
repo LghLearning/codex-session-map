@@ -20,8 +20,9 @@ export class ProgressiveOrganizationService {
   async start(request: OrganizationRequest): Promise<OrganizationJob> {
     const active = this.#repository.active(request.workspaceId);
     if (active) return active;
+    const planningStarted = performance.now();
     const plan = await this.#plan(request);
-    const job = this.#repository.createJob(randomUUID(), request, plan.items, this.#stamp(), plan.reused);
+    const job = this.#repository.createJob(randomUUID(), request, plan.items, this.#stamp(), plan.reused, { planningMs: performance.now() - planningStarted });
     this.#schedule(job.id);
     return this.#repository.getJob(job.id)!;
   }
@@ -108,6 +109,8 @@ export class ProgressiveOrganizationService {
 
   async #execute(item: OrganizationItem, token: number, signal: AbortSignal): Promise<void> {
     const now = this.#stamp();
+    const queuedAt = Date.parse(this.#require(item.jobId).createdAt);
+    this.#repository.addItemMetrics(item.id, { queueMs: Math.max(0, Date.parse(now) - queuedAt) });
     this.#repository.updateItem(item.id, "running", now, { incrementAttempts: true });
     try {
       const before = await this.#inspect(item);
@@ -119,7 +122,12 @@ export class ProgressiveOrganizationService {
         const current = this.#repository.getJob(item.jobId);
         return Boolean(current && current.runToken === token && !["canceling", "canceled", "interrupted"].includes(current.status));
       };
-      await this.#generate(item, { signal, expectedFingerprint: before.sourceFingerprint, mayCommit });
+      await this.#generate(item, {
+        signal,
+        expectedFingerprint: before.sourceFingerprint,
+        mayCommit,
+        recordMetrics: (metrics) => this.#repository.addItemMetrics(item.id, metrics),
+      });
       if (!mayCommit()) {
         this.#repository.updateItem(item.id, "canceled", this.#stamp(), { errorCode: "canceled", error: "Result discarded after cancellation." });
         return;
@@ -142,11 +150,11 @@ export class ProgressiveOrganizationService {
     }
   }
 
-  async #plan(request: OrganizationRequest): Promise<{ items: Omit<OrganizationItem, "jobId" | "status" | "attempts">[]; reused: Record<"trace" | "title" | "parent", number> }> {
+  async #plan(request: OrganizationRequest): Promise<{ items: Omit<OrganizationItem, "jobId" | "status" | "attempts" | "metrics">[]; reused: Record<"trace" | "title" | "parent", number> }> {
     const sessions = (await this.#port.listSessions(request.workspaceId))
       .filter((session) => !session.excludedFromMainWorkspaceForest && (!request.sessionId || session.providerSessionId === request.sessionId))
       .sort(priority(request));
-    const items: Omit<OrganizationItem, "jobId" | "status" | "attempts">[] = [];
+    const items: Omit<OrganizationItem, "jobId" | "status" | "attempts" | "metrics">[] = [];
     const reused = { trace: 0, title: 0, parent: 0 };
     const traceSessions = new Set<string>();
     if (request.mode === "full") {
@@ -211,7 +219,7 @@ export class ProgressiveOrganizationService {
   #stamp(): string { return this.#now().toISOString(); }
 }
 
-function planned(workspaceId: string, session: Session, turn: Turn | undefined, operation: "trace" | "title" | "parent", state: OrganizationFreshness): Omit<OrganizationItem, "jobId" | "status" | "attempts"> {
+function planned(workspaceId: string, session: Session, turn: Turn | undefined, operation: "trace" | "title" | "parent", state: OrganizationFreshness): Omit<OrganizationItem, "jobId" | "status" | "attempts" | "metrics"> {
   return { id: randomUUID(), workspaceId, sessionId: session.providerSessionId, nativeTurnId: turn?.nativeTurnId, entityType: turn ? "turn" : "session", operation, sourceFingerprint: state.sourceFingerprint, strategyVersion: state.strategyVersion };
 }
 

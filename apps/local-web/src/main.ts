@@ -187,13 +187,13 @@ async function createSemanticPreview(values: readonly string[], onOrganizationCo
           const lookup = await traceService.inspect(turn);
           return { freshness: lookup.freshness, sourceFingerprint: lookup.currentInputFingerprint, strategyVersion: identity(generator.identity) };
         },
-        generateTrace: async (turn, context) => { await traceService.ensure(turn, { signal: context.signal, mayCommit: context.mayCommit }); },
+        generateTrace: async (turn, context) => { await traceService.ensure(turn, { signal: context.signal, mayCommit: context.mayCommit, onMetrics: context.recordMetrics }); },
         inspectTitle: async (session) => {
           const lookup = await titleService.inspect(await titleSource(session, await listAllTurns(session.providerSessionId)));
           return { freshness: lookup.freshness, sourceFingerprint: lookup.currentSourceFingerprint, strategyVersion: identity(titleGenerator.identity) };
         },
         generateTitle: async (session, context) => {
-          await titleService.generate(await titleSource(session, await listAllTurns(session.providerSessionId)), { signal: context.signal, mayCommit: context.mayCommit });
+          await titleService.generate(await titleSource(session, await listAllTurns(session.providerSessionId)), { signal: context.signal, mayCommit: context.mayCommit, onMetrics: context.recordMetrics });
         },
         inspectParent: async (session) => {
           const context = await parentContext(session);
@@ -202,7 +202,7 @@ async function createSemanticPreview(values: readonly string[], onOrganizationCo
         },
         generateParent: async (session, execution) => {
           const context = await parentContext(session);
-          await parentService.generate(context.source, context.sessions, { signal: execution.signal, mayCommit: execution.mayCommit });
+          await parentService.generate(context.source, context.sessions, { signal: execution.signal, mayCommit: execution.mayCommit, onMetrics: execution.recordMetrics });
         },
         onCommitted: onOrganizationCommit,
       },

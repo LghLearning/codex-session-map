@@ -57,14 +57,32 @@ export class PromptTurnSemanticTraceGenerator implements TurnSemanticTraceGenera
 
   async generate(turn: Turn, options?: SemanticGenerationOptions): Promise<GeneratedSemanticTrace> {
     const request = { ...this.#requestBuilder(turn), signal: options?.signal };
-    const first = await this.#client.complete(request);
-    const firstInspection = inspectSemanticTraceSafety(turn, first);
-    const guardTriggered = this.#safetyGuard && firstInspection.statusUpgradeSuspected;
-    const final = guardTriggered ? await this.#client.complete({
-      ...request,
-      system: `${request.system} The previous output may have changed an unfinished, planned, suggested, predicted, or unverified state into a completed state. Regenerate it while strictly preserving the Turn's execution state and certainty. The user's request is not completion evidence; use only an explicit completed result in assistantFinal or a successful tool outcome as completion evidence.`,
-    }) : first;
-    const finalInspection = inspectSemanticTraceSafety(turn, final);
+    let modelMs = 0;
+    let retryCount = 0;
+    const complete = async (value: SemanticTraceCompletionRequest): Promise<string> => {
+      const started = performance.now();
+      try { return await this.#client.complete(value); }
+      finally { modelMs += performance.now() - started; }
+    };
+    let first: string;
+    let final: string;
+    let firstInspection: ReturnType<typeof inspectSemanticTraceSafety>;
+    let finalInspection: ReturnType<typeof inspectSemanticTraceSafety>;
+    let guardTriggered = false;
+    const validationStarted = performance.now();
+    try {
+      first = await complete(request);
+      firstInspection = inspectSemanticTraceSafety(turn, first);
+      guardTriggered = this.#safetyGuard && firstInspection.statusUpgradeSuspected;
+      if (guardTriggered) retryCount = 1;
+      final = guardTriggered ? await complete({
+        ...request,
+        system: `${request.system} The previous output may have changed an unfinished, planned, suggested, predicted, or unverified state into a completed state. Regenerate it while strictly preserving the Turn's execution state and certainty. The user's request is not completion evidence; use only an explicit completed result in assistantFinal or a successful tool outcome as completion evidence.`,
+      }) : first;
+      finalInspection = inspectSemanticTraceSafety(turn, final);
+    } finally {
+      options?.onMetrics?.({ inputChars: request.system.length + request.input.length, modelMs, validationMs: Math.max(0, performance.now() - validationStarted - modelMs), retryCount });
+    }
     this.#onDiagnostics?.({
       providerId: turn.providerId,
       sessionId: turn.sessionId,

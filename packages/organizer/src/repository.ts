@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import type { OrganizationCounts, OrganizationItem, OrganizationItemStatus, OrganizationJob, OrganizationJobStatus, OrganizationMode, OrganizationOperation, OrganizationRequest } from "./types.ts";
+import type { OrganizationCounts, OrganizationItem, OrganizationItemStatus, OrganizationJob, OrganizationJobStatus, OrganizationMetricDelta, OrganizationMode, OrganizationOperation, OrganizationRequest } from "./types.ts";
 
 export class OrganizationRepository {
   readonly #db: DatabaseSync;
@@ -13,7 +13,8 @@ export class OrganizationRepository {
         session_id TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL,
         started_at TEXT, updated_at TEXT NOT NULL, completed_at TEXT,
         requested_by TEXT NOT NULL, run_token INTEGER NOT NULL DEFAULT 0, error TEXT,
-        reused_trace INTEGER NOT NULL DEFAULT 0, reused_title INTEGER NOT NULL DEFAULT 0, reused_parent INTEGER NOT NULL DEFAULT 0
+        reused_trace INTEGER NOT NULL DEFAULT 0, reused_title INTEGER NOT NULL DEFAULT 0, reused_parent INTEGER NOT NULL DEFAULT 0,
+        planning_ms REAL NOT NULL DEFAULT 0, snapshot_preparation_ms REAL NOT NULL DEFAULT 0
       );
       CREATE INDEX IF NOT EXISTS organization_jobs_workspace ON organization_jobs(workspace_id, updated_at DESC);
       CREATE TABLE IF NOT EXISTS organization_items (
@@ -22,20 +23,24 @@ export class OrganizationRepository {
         entity_type TEXT NOT NULL, operation TEXT NOT NULL, source_fingerprint TEXT NOT NULL,
         strategy_version TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
         error_code TEXT, error TEXT, started_at TEXT, completed_at TEXT,
+        queue_ms REAL NOT NULL DEFAULT 0, input_chars INTEGER NOT NULL DEFAULT 0,
+        model_ms REAL NOT NULL DEFAULT 0, validation_ms REAL NOT NULL DEFAULT 0,
+        commit_ms REAL NOT NULL DEFAULT 0, retry_count INTEGER NOT NULL DEFAULT 0,
         UNIQUE(job_id, operation, session_id, native_turn_id)
       );
       CREATE INDEX IF NOT EXISTS organization_items_job ON organization_items(job_id, operation, status);
       CREATE INDEX IF NOT EXISTS organization_items_dedupe ON organization_items(workspace_id, operation, session_id, native_turn_id, source_fingerprint, strategy_version, status);
     `);
     this.#ensureReuseColumns();
+    this.#ensureMetricColumns();
     this.interruptActiveJobs();
   }
 
-  createJob(id: string, request: OrganizationRequest, items: readonly Omit<OrganizationItem, "jobId" | "status" | "attempts">[], now: string, reused: Readonly<Record<OrganizationOperation, number>> = { trace: 0, title: 0, parent: 0 }): OrganizationJob {
+  createJob(id: string, request: OrganizationRequest, items: readonly Omit<OrganizationItem, "jobId" | "status" | "attempts" | "metrics">[], now: string, reused: Readonly<Record<OrganizationOperation, number>> = { trace: 0, title: 0, parent: 0 }, timing: { planningMs?: number; snapshotPreparationMs?: number } = {}): OrganizationJob {
     this.#db.exec("BEGIN IMMEDIATE");
     try {
-      this.#db.prepare(`INSERT INTO organization_jobs(id,workspace_id,mode,session_id,status,created_at,updated_at,requested_by,reused_trace,reused_title,reused_parent)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(id, request.workspaceId, request.mode, request.sessionId ?? null, "queued", now, now, request.requestedBy ?? "user", reused.trace, reused.title, reused.parent);
+      this.#db.prepare(`INSERT INTO organization_jobs(id,workspace_id,mode,session_id,status,created_at,updated_at,requested_by,reused_trace,reused_title,reused_parent,planning_ms,snapshot_preparation_ms)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, request.workspaceId, request.mode, request.sessionId ?? null, "queued", now, now, request.requestedBy ?? "user", reused.trace, reused.title, reused.parent, timing.planningMs ?? 0, timing.snapshotPreparationMs ?? 0);
       const insert = this.#db.prepare(`INSERT INTO organization_items(id,job_id,workspace_id,session_id,native_turn_id,entity_type,operation,source_fingerprint,strategy_version,status)
         VALUES(?,?,?,?,?,?,?,?,?,?)`);
       for (const item of items) insert.run(item.id, id, item.workspaceId, item.sessionId, item.nativeTurnId ?? null, item.entityType, item.operation, item.sourceFingerprint, item.strategyVersion, "queued");
@@ -86,6 +91,12 @@ export class OrganizationRepository {
     this.#touchItemJob(id, now);
   }
 
+  addItemMetrics(id: string, metrics: OrganizationMetricDelta): void {
+    this.#db.prepare(`UPDATE organization_items SET queue_ms=queue_ms+?, input_chars=input_chars+?, model_ms=model_ms+?,
+      validation_ms=validation_ms+?, commit_ms=commit_ms+?, retry_count=retry_count+? WHERE id=?`)
+      .run(metrics.queueMs ?? 0, metrics.inputChars ?? 0, metrics.modelMs ?? 0, metrics.validationMs ?? 0, metrics.commitMs ?? 0, metrics.retryCount ?? 0, id);
+  }
+
   resetRetryable(jobId: string, now: string): void {
     this.#db.prepare("UPDATE organization_items SET status='queued', error_code=NULL, error=NULL, started_at=NULL, completed_at=NULL WHERE job_id=? AND status IN ('failed','stale','canceled')").run(jobId);
     this.#db.prepare("UPDATE organization_jobs SET status='queued', updated_at=?, completed_at=NULL, error=NULL, run_token=run_token+1 WHERE id=?").run(now, jobId);
@@ -113,6 +124,7 @@ export class OrganizationRepository {
       id: row.id, workspaceId: row.workspace_id, mode: row.mode, sessionId: row.session_id ?? undefined,
       status: row.status, createdAt: row.created_at, startedAt: row.started_at ?? undefined, updatedAt: row.updated_at,
       completedAt: row.completed_at ?? undefined, requestedBy: row.requested_by, runToken: row.run_token, error: row.error ?? undefined,
+      planningMs: row.planning_ms, snapshotPreparationMs: row.snapshot_preparation_ms,
       counts: this.#counts(row),
       lastCommitted: latest ? { sessionId: latest.session_id, nativeTurnId: latest.native_turn_id ?? undefined, operation: latest.operation, completedAt: latest.completed_at ?? undefined } : undefined,
     };
@@ -142,8 +154,15 @@ export class OrganizationRepository {
     const columns = new Set((this.#db.prepare("PRAGMA table_info(organization_jobs)").all() as unknown as { name: string }[]).map((column) => column.name));
     for (const name of ["reused_trace", "reused_title", "reused_parent"]) if (!columns.has(name)) this.#db.exec(`ALTER TABLE organization_jobs ADD COLUMN ${name} INTEGER NOT NULL DEFAULT 0`);
   }
+
+  #ensureMetricColumns(): void {
+    const jobColumns = new Set((this.#db.prepare("PRAGMA table_info(organization_jobs)").all() as unknown as { name: string }[]).map((column) => column.name));
+    for (const [name, type] of [["planning_ms", "REAL"], ["snapshot_preparation_ms", "REAL"]] as const) if (!jobColumns.has(name)) this.#db.exec(`ALTER TABLE organization_jobs ADD COLUMN ${name} ${type} NOT NULL DEFAULT 0`);
+    const itemColumns = new Set((this.#db.prepare("PRAGMA table_info(organization_items)").all() as unknown as { name: string }[]).map((column) => column.name));
+    for (const [name, type] of [["queue_ms", "REAL"], ["input_chars", "INTEGER"], ["model_ms", "REAL"], ["validation_ms", "REAL"], ["commit_ms", "REAL"], ["retry_count", "INTEGER"]] as const) if (!itemColumns.has(name)) this.#db.exec(`ALTER TABLE organization_items ADD COLUMN ${name} ${type} NOT NULL DEFAULT 0`);
+  }
 }
 
-interface JobRow { id: string; workspace_id: string; mode: OrganizationMode; session_id: string | null; status: OrganizationJobStatus; created_at: string; started_at: string | null; updated_at: string; completed_at: string | null; requested_by: string; run_token: number; error: string | null; reused_trace: number; reused_title: number; reused_parent: number }
-interface ItemRow { id: string; job_id: string; workspace_id: string; session_id: string; native_turn_id: string | null; entity_type: "turn" | "session"; operation: OrganizationOperation; source_fingerprint: string; strategy_version: string; status: OrganizationItemStatus; attempts: number; error_code: OrganizationItem["errorCode"] | null; error: string | null; started_at: string | null; completed_at: string | null }
-function projectItem(row: ItemRow): OrganizationItem { return { id: row.id, jobId: row.job_id, workspaceId: row.workspace_id, sessionId: row.session_id, nativeTurnId: row.native_turn_id ?? undefined, entityType: row.entity_type, operation: row.operation, sourceFingerprint: row.source_fingerprint, strategyVersion: row.strategy_version, status: row.status, attempts: row.attempts, errorCode: row.error_code ?? undefined, error: row.error ?? undefined, startedAt: row.started_at ?? undefined, completedAt: row.completed_at ?? undefined }; }
+interface JobRow { id: string; workspace_id: string; mode: OrganizationMode; session_id: string | null; status: OrganizationJobStatus; created_at: string; started_at: string | null; updated_at: string; completed_at: string | null; requested_by: string; run_token: number; error: string | null; reused_trace: number; reused_title: number; reused_parent: number; planning_ms: number; snapshot_preparation_ms: number }
+interface ItemRow { id: string; job_id: string; workspace_id: string; session_id: string; native_turn_id: string | null; entity_type: "turn" | "session"; operation: OrganizationOperation; source_fingerprint: string; strategy_version: string; status: OrganizationItemStatus; attempts: number; error_code: OrganizationItem["errorCode"] | null; error: string | null; started_at: string | null; completed_at: string | null; queue_ms: number; input_chars: number; model_ms: number; validation_ms: number; commit_ms: number; retry_count: number }
+function projectItem(row: ItemRow): OrganizationItem { return { id: row.id, jobId: row.job_id, workspaceId: row.workspace_id, sessionId: row.session_id, nativeTurnId: row.native_turn_id ?? undefined, entityType: row.entity_type, operation: row.operation, sourceFingerprint: row.source_fingerprint, strategyVersion: row.strategy_version, status: row.status, attempts: row.attempts, errorCode: row.error_code ?? undefined, error: row.error ?? undefined, startedAt: row.started_at ?? undefined, completedAt: row.completed_at ?? undefined, metrics: { queueMs: row.queue_ms, inputChars: row.input_chars, modelMs: row.model_ms, validationMs: row.validation_ms, commitMs: row.commit_ms, retryCount: row.retry_count } }; }

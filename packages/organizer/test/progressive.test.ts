@@ -34,6 +34,27 @@ test("Full runs missing traces before dependent title and parent with concurrenc
   repository.close();
 });
 
+test("runtime metrics persist planning and per-operation timing without changing execution", async () => {
+  const fixture = new FixturePort();
+  fixture.title.set("b", "current"); fixture.parent.set("b", "current");
+  const { service, repository } = setup(fixture);
+  const started = await service.start({ workspaceId: "workspace", mode: "quick" });
+  const finished = await waitFor(service, started.id, "completed");
+  assert.ok(finished.planningMs >= 0);
+  assert.equal(finished.snapshotPreparationMs, 0);
+  const generated = service.items(started.id).filter((item) => item.status === "success");
+  assert.equal(generated.length, 2);
+  for (const item of generated) {
+    assert.equal(item.metrics.inputChars, 120);
+    assert.equal(item.metrics.modelMs, 7);
+    assert.equal(item.metrics.validationMs, 2);
+    assert.equal(item.metrics.commitMs, 1);
+    assert.equal(item.metrics.retryCount, 1);
+    assert.ok(item.metrics.queueMs >= 0);
+  }
+  repository.close();
+});
+
 test("one failed item does not stop later items and retry executes only failed work", async () => {
   const fixture = new FixturePort(); fixture.failOnce.add("title:a");
   const { service, repository } = setup(fixture);
@@ -127,6 +148,7 @@ class FixturePort implements ProgressiveOrganizationPort {
   async generate(key: string, context: OrganizationExecutionContext, commit: () => void) {
     this.calls.push(key); this.concurrent += 1; this.maxConcurrent = Math.max(this.maxConcurrent, this.concurrent);
     try {
+      context.recordMetrics({ inputChars: 120, modelMs: 7, validationMs: 2, commitMs: 1, retryCount: 1 });
       if (this.failOnce.delete(key)) throw new Error("model unavailable");
       if (this.gate) { const gate = this.gate; await gate.promise; if (this.gate === gate) this.gate = undefined; }
       if (this.changeSourceOn.delete(key)) this.fingerprints.set(key, "changed-fingerprint");

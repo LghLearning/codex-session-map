@@ -27,7 +27,12 @@ export class PromptSemanticSessionTitleGenerator implements SemanticSessionTitle
   }
 
   async generate(source: SemanticSessionTitleSource, options?: SemanticGenerationOptions): Promise<GeneratedSemanticSessionTitle> {
-    return { title: await this.#client.complete({ ...buildSemanticSessionTitleRequest(source), signal: options?.signal }) };
+    const request = { ...buildSemanticSessionTitleRequest(source), signal: options?.signal };
+    const started = performance.now();
+    try { return { title: await this.#client.complete(request) }; }
+    finally {
+      options?.onMetrics?.({ inputChars: request.system.length + request.input.length, modelMs: performance.now() - started, retryCount: 0 });
+    }
   }
 }
 
