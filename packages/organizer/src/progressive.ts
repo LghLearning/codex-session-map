@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Session, Turn } from "../../core/src/index.ts";
 import { OrganizationRepository } from "./repository.ts";
-import type { OrganizationErrorCode, OrganizationFreshness, OrganizationItem, OrganizationJob, OrganizationRequest, ProgressiveOrganizationPort } from "./types.ts";
+import type { OrganizationErrorCode, OrganizationFreshness, OrganizationItem, OrganizationJob, OrganizationRequest, ProgressiveOrganizationPort, WorkspaceOrganizationBaseSnapshot } from "./types.ts";
 
 export class ProgressiveOrganizationService {
   readonly #repository: OrganizationRepository;
@@ -9,6 +9,7 @@ export class ProgressiveOrganizationService {
   readonly #controllers = new Map<string, AbortController>();
   readonly #running = new Set<string>();
   readonly #tasks = new Map<string, Promise<void>>();
+  readonly #snapshots = new Map<string, WorkspaceOrganizationBaseSnapshot>();
   readonly #now: () => Date;
 
   constructor(options: { repository: OrganizationRepository; port: ProgressiveOrganizationPort; now?: () => Date }) {
@@ -20,9 +21,13 @@ export class ProgressiveOrganizationService {
   async start(request: OrganizationRequest): Promise<OrganizationJob> {
     const active = this.#repository.active(request.workspaceId);
     if (active) return active;
+    const snapshotStarted = performance.now();
+    const snapshot = await this.#prepareSnapshot(request.workspaceId);
+    const snapshotPreparationMs = performance.now() - snapshotStarted;
     const planningStarted = performance.now();
-    const plan = await this.#plan(request);
-    const job = this.#repository.createJob(randomUUID(), request, plan.items, this.#stamp(), plan.reused, { planningMs: performance.now() - planningStarted });
+    const plan = await this.#plan(request, snapshot);
+    const job = this.#repository.createJob(randomUUID(), request, plan.items, this.#stamp(), plan.reused, { planningMs: performance.now() - planningStarted, snapshotPreparationMs });
+    this.#snapshots.set(job.id, snapshot);
     this.#schedule(job.id);
     return this.#repository.getJob(job.id)!;
   }
@@ -66,6 +71,7 @@ export class ProgressiveOrganizationService {
     for (const controller of this.#controllers.values()) controller.abort();
     this.#repository.interruptActiveJobs();
     await Promise.allSettled(this.#tasks.values());
+    this.#snapshots.clear();
   }
 
   #schedule(jobId: string): void {
@@ -83,8 +89,14 @@ export class ProgressiveOrganizationService {
       if (job.status === "canceling") { this.#finishCanceled(jobId); return; }
       if (job.status === "pausing") { this.#repository.updateJob(jobId, "paused", this.#stamp()); return; }
       if (job.status !== "queued") return;
+      if (!this.#snapshots.has(jobId)) {
+        const started = performance.now();
+        this.#snapshots.set(jobId, await this.#prepareSnapshot(job.workspaceId));
+        this.#repository.addSnapshotPreparation(jobId, performance.now() - started);
+      }
       job = this.#repository.updateJob(jobId, "running", this.#stamp());
       const token = job.runToken;
+      const snapshot = this.#snapshots.get(jobId)!;
       for (;;) {
         job = this.#require(jobId);
         if (job.status === "interrupted") return;
@@ -92,7 +104,7 @@ export class ProgressiveOrganizationService {
         if (job.status === "pausing") { this.#repository.updateJob(jobId, "paused", this.#stamp()); return; }
         const item = this.#repository.nextQueued(jobId);
         if (!item) break;
-        await this.#execute(item, token, controller.signal);
+        await this.#execute(item, token, controller.signal, snapshot);
       }
       const counts = this.#require(jobId).counts;
       this.#repository.updateJob(jobId, counts.failed || counts.stale ? "completed_with_failures" : "completed", this.#stamp());
@@ -104,16 +116,18 @@ export class ProgressiveOrganizationService {
       else this.#repository.updateJob(jobId, "failed", this.#stamp(), { error: message(error) });
     } finally {
       this.#controllers.delete(jobId);
+      const status = this.#repository.getJob(jobId)?.status;
+      if (status && ["completed", "completed_with_failures", "canceled", "failed"].includes(status)) this.#snapshots.delete(jobId);
     }
   }
 
-  async #execute(item: OrganizationItem, token: number, signal: AbortSignal): Promise<void> {
+  async #execute(item: OrganizationItem, token: number, signal: AbortSignal, snapshot: WorkspaceOrganizationBaseSnapshot): Promise<void> {
     const now = this.#stamp();
     const queuedAt = Date.parse(this.#require(item.jobId).createdAt);
     this.#repository.addItemMetrics(item.id, { queueMs: Math.max(0, Date.parse(now) - queuedAt) });
     this.#repository.updateItem(item.id, "running", now, { incrementAttempts: true });
     try {
-      const before = await this.#inspect(item);
+      const before = await this.#inspect(item, snapshot);
       if (before.freshness === "current") {
         this.#repository.updateItem(item.id, "reused", this.#stamp(), { sourceFingerprint: before.sourceFingerprint, strategyVersion: before.strategyVersion });
         return;
@@ -127,6 +141,7 @@ export class ProgressiveOrganizationService {
         expectedFingerprint: before.sourceFingerprint,
         mayCommit,
         recordMetrics: (metrics) => this.#repository.addItemMetrics(item.id, metrics),
+        snapshot,
       });
       if (!mayCommit()) {
         this.#repository.updateItem(item.id, "canceled", this.#stamp(), { errorCode: "canceled", error: "Result discarded after cancellation." });
@@ -150,8 +165,8 @@ export class ProgressiveOrganizationService {
     }
   }
 
-  async #plan(request: OrganizationRequest): Promise<{ items: Omit<OrganizationItem, "jobId" | "status" | "attempts" | "metrics">[]; reused: Record<"trace" | "title" | "parent", number> }> {
-    const sessions = (await this.#port.listSessions(request.workspaceId))
+  async #plan(request: OrganizationRequest, snapshot: WorkspaceOrganizationBaseSnapshot): Promise<{ items: Omit<OrganizationItem, "jobId" | "status" | "attempts" | "metrics">[]; reused: Record<"trace" | "title" | "parent", number> }> {
+    const sessions = snapshot.sessions
       .filter((session) => !session.excludedFromMainWorkspaceForest && (!request.sessionId || session.providerSessionId === request.sessionId))
       .sort(priority(request));
     const items: Omit<OrganizationItem, "jobId" | "status" | "attempts" | "metrics">[] = [];
@@ -159,7 +174,7 @@ export class ProgressiveOrganizationService {
     const traceSessions = new Set<string>();
     if (request.mode === "full") {
       for (const session of sessions) {
-        for (const turn of (await this.#port.listTurns(session.providerSessionId)).slice().sort((a, b) => a.displayOrdinal - b.displayOrdinal)) {
+        for (const turn of (snapshot.turnsBySession.get(session.providerSessionId) ?? []).slice().sort((a, b) => a.displayOrdinal - b.displayOrdinal)) {
           const state = await this.#port.inspectTrace(turn);
           if (needsWork(state, request.staleOnly)) {
             items.push(planned(request.workspaceId, session, turn, "trace", state));
@@ -170,14 +185,14 @@ export class ProgressiveOrganizationService {
     }
     const titleSessions = new Set<string>();
     for (const session of sessions) {
-      const state = await this.#port.inspectTitle(session);
+      const state = await this.#port.inspectTitle(session, snapshot);
       if (needsWork(state, request.staleOnly) || traceSessions.has(session.providerSessionId)) {
         items.push(planned(request.workspaceId, session, undefined, "title", state));
         titleSessions.add(session.providerSessionId);
       } else if (state.freshness === "current") reused.title += 1;
     }
     for (const session of sessions) {
-      const state = await this.#port.inspectParent(session);
+      const state = await this.#port.inspectParent(session, snapshot);
       // Parent inputs include ranked Workspace candidates, so any planned title can invalidate a current relation.
       if (needsWork(state, request.staleOnly) || titleSessions.size > 0) items.push(planned(request.workspaceId, session, undefined, "parent", state));
       else if (state.freshness === "current") reused.parent += 1;
@@ -185,22 +200,24 @@ export class ProgressiveOrganizationService {
     return { items, reused };
   }
 
-  async #inspect(item: OrganizationItem): Promise<OrganizationFreshness> {
-    const session = (await this.#port.listSessions(item.workspaceId)).find((value) => value.providerSessionId === item.sessionId);
+  async #inspect(item: OrganizationItem, snapshot?: WorkspaceOrganizationBaseSnapshot): Promise<OrganizationFreshness> {
+    const sessions = snapshot?.sessions ?? await this.#port.listSessions(item.workspaceId);
+    const session = sessions.find((value) => value.providerSessionId === item.sessionId);
     if (!session) throw new Error("Organization Session is no longer available.");
-    if (item.operation === "title") return this.#port.inspectTitle(session);
-    if (item.operation === "parent") return this.#port.inspectParent(session);
-    const turn = (await this.#port.listTurns(item.sessionId)).find((value) => value.nativeTurnId === item.nativeTurnId);
+    if (item.operation === "title") return this.#port.inspectTitle(session, snapshot);
+    if (item.operation === "parent") return this.#port.inspectParent(session, snapshot);
+    const turns = snapshot?.turnsBySession.get(item.sessionId) ?? await this.#port.listTurns(item.sessionId);
+    const turn = turns.find((value) => value.nativeTurnId === item.nativeTurnId);
     if (!turn) throw new Error("Organization Turn is no longer available.");
     return this.#port.inspectTrace(turn);
   }
 
   async #generate(item: OrganizationItem, context: Parameters<ProgressiveOrganizationPort["generateTitle"]>[1]): Promise<void> {
-    const session = (await this.#port.listSessions(item.workspaceId)).find((value) => value.providerSessionId === item.sessionId);
+    const session = context.snapshot.sessions.find((value) => value.providerSessionId === item.sessionId);
     if (!session) throw new Error("Organization Session is no longer available.");
     if (item.operation === "title") return this.#port.generateTitle(session, context);
     if (item.operation === "parent") return this.#port.generateParent(session, context);
-    const turn = (await this.#port.listTurns(item.sessionId)).find((value) => value.nativeTurnId === item.nativeTurnId);
+    const turn = context.snapshot.turnsBySession.get(item.sessionId)?.find((value) => value.nativeTurnId === item.nativeTurnId);
     if (!turn) throw new Error("Organization Turn is no longer available.");
     return this.#port.generateTrace(turn, context);
   }
@@ -208,6 +225,15 @@ export class ProgressiveOrganizationService {
   #finishCanceled(jobId: string): void {
     this.#repository.cancelPending(jobId, this.#stamp());
     this.#repository.updateJob(jobId, "canceled", this.#stamp());
+  }
+
+  async #prepareSnapshot(workspaceId: string): Promise<WorkspaceOrganizationBaseSnapshot> {
+    const sessions = (await this.#port.listSessions(workspaceId)).filter((session) => !session.excludedFromMainWorkspaceForest);
+    const [turnEntries, lineageEntries] = await Promise.all([
+      Promise.all(sessions.map(async (session) => [session.providerSessionId, await this.#port.listTurns(session.providerSessionId)] as const)),
+      Promise.all(sessions.map(async (session) => [session.providerSessionId, await this.#port.getNativeLineage?.(session.providerSessionId) ?? null] as const)),
+    ]);
+    return { workspaceId, sessions, turnsBySession: new Map(turnEntries), nativeLineageBySession: new Map(lineageEntries) };
   }
 
   #require(jobId: string): OrganizationJob {

@@ -1,4 +1,4 @@
-import type { Session, Turn } from "../../core/src/index.ts";
+import type { NativeLineage, Session, Turn } from "../../core/src/index.ts";
 
 export type OrganizationMode = "quick" | "full";
 export type OrganizationOperation = "trace" | "title" | "parent";
@@ -84,6 +84,13 @@ export interface OrganizationItemMetrics {
 
 export type OrganizationMetricDelta = Partial<OrganizationItemMetrics>;
 
+export interface WorkspaceOrganizationBaseSnapshot {
+  readonly workspaceId: string;
+  readonly sessions: readonly Session[];
+  readonly turnsBySession: ReadonlyMap<string, readonly Turn[]>;
+  readonly nativeLineageBySession: ReadonlyMap<string, NativeLineage | null>;
+}
+
 export type OrganizationErrorCode = "model_unavailable" | "model_timeout" | "generation_invalid" | "semantic_validation" | "source_changed" | "dependency_unavailable" | "storage_failure" | "canceled" | "unknown";
 
 export interface OrganizationFreshness {
@@ -97,16 +104,18 @@ export interface OrganizationExecutionContext {
   readonly expectedFingerprint: string;
   readonly mayCommit: () => boolean;
   readonly recordMetrics: (metrics: OrganizationMetricDelta) => void;
+  readonly snapshot: WorkspaceOrganizationBaseSnapshot;
 }
 
 export interface ProgressiveOrganizationPort {
   listSessions(workspaceId: string): Promise<readonly Session[]>;
   listTurns(sessionId: string): Promise<readonly Turn[]>;
+  getNativeLineage?(sessionId: string): Promise<NativeLineage | null>;
   inspectTrace(turn: Turn): Promise<OrganizationFreshness>;
   generateTrace(turn: Turn, context: OrganizationExecutionContext): Promise<void>;
-  inspectTitle(session: Session): Promise<OrganizationFreshness>;
+  inspectTitle(session: Session, snapshot?: WorkspaceOrganizationBaseSnapshot): Promise<OrganizationFreshness>;
   generateTitle(session: Session, context: OrganizationExecutionContext): Promise<void>;
-  inspectParent(session: Session): Promise<OrganizationFreshness>;
+  inspectParent(session: Session, snapshot?: WorkspaceOrganizationBaseSnapshot): Promise<OrganizationFreshness>;
   generateParent(session: Session, context: OrganizationExecutionContext): Promise<void>;
   onCommitted?(item: OrganizationItem): void;
 }

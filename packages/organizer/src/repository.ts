@@ -97,6 +97,10 @@ export class OrganizationRepository {
       .run(metrics.queueMs ?? 0, metrics.inputChars ?? 0, metrics.modelMs ?? 0, metrics.validationMs ?? 0, metrics.commitMs ?? 0, metrics.retryCount ?? 0, id);
   }
 
+  addSnapshotPreparation(id: string, durationMs: number): void {
+    this.#db.prepare("UPDATE organization_jobs SET snapshot_preparation_ms=snapshot_preparation_ms+? WHERE id=?").run(durationMs, id);
+  }
+
   resetRetryable(jobId: string, now: string): void {
     this.#db.prepare("UPDATE organization_items SET status='queued', error_code=NULL, error=NULL, started_at=NULL, completed_at=NULL WHERE job_id=? AND status IN ('failed','stale','canceled')").run(jobId);
     this.#db.prepare("UPDATE organization_jobs SET status='queued', updated_at=?, completed_at=NULL, error=NULL, run_token=run_token+1 WHERE id=?").run(now, jobId);

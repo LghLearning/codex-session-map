@@ -31,6 +31,9 @@ test("Full runs missing traces before dependent title and parent with concurrenc
   assert.equal(fixture.maxConcurrent, 1);
   assert.deepEqual(fixture.calls.slice(0, 4), ["trace:b/turn-b", "trace:a/turn-a", "title:b", "title:a"]);
   assert.deepEqual(fixture.calls.slice(-2), ["parent:b", "parent:a"]);
+  assert.equal(fixture.titleSawLatestTrace, true);
+  assert.equal(fixture.parentSawLatestTitles, true);
+  assert.ok(fixture.sessionReads < 10, `expected snapshot reuse, observed ${fixture.sessionReads} Session reads`);
   repository.close();
 });
 
@@ -41,7 +44,7 @@ test("runtime metrics persist planning and per-operation timing without changing
   const started = await service.start({ workspaceId: "workspace", mode: "quick" });
   const finished = await waitFor(service, started.id, "completed");
   assert.ok(finished.planningMs >= 0);
-  assert.equal(finished.snapshotPreparationMs, 0);
+  assert.ok(finished.snapshotPreparationMs >= 0);
   const generated = service.items(started.id).filter((item) => item.status === "success");
   assert.equal(generated.length, 2);
   for (const item of generated) {
@@ -136,14 +139,21 @@ class FixturePort implements ProgressiveOrganizationPort {
   readonly failOnce = new Set<string>(); readonly calls: string[] = [];
   readonly changeSourceOn = new Set<string>(); readonly fingerprints = new Map<string, string>();
   concurrent = 0; maxConcurrent = 0; gate?: ReturnType<typeof deferred<void>>;
-  async listSessions() { return this.sessions; }
-  async listTurns(sessionId: string) { return this.turns.get(sessionId) ?? []; }
+  sessionReads = 0; turnReads = 0; titleSawLatestTrace = true; parentSawLatestTitles = true;
+  async listSessions() { this.sessionReads += 1; return this.sessions; }
+  async listTurns(sessionId: string) { this.turnReads += 1; return this.turns.get(sessionId) ?? []; }
   async inspectTrace(value: Turn) { const key = `trace:${value.sessionId}/${value.nativeTurnId}`; return state(this.trace.get(`${value.sessionId}/${value.nativeTurnId}`), this.fingerprints.get(key)); }
   async inspectTitle(value: Session) { const key = `title:${value.providerSessionId}`; return state(this.title.get(value.providerSessionId), this.fingerprints.get(key)); }
   async inspectParent(value: Session) { const key = `parent:${value.providerSessionId}`; return state(this.parent.get(value.providerSessionId), this.fingerprints.get(key)); }
   async generateTrace(value: Turn, context: OrganizationExecutionContext) { await this.generate(`trace:${value.sessionId}/${value.nativeTurnId}`, context, () => this.trace.set(`${value.sessionId}/${value.nativeTurnId}`, "current")); }
-  async generateTitle(value: Session, context: OrganizationExecutionContext) { await this.generate(`title:${value.providerSessionId}`, context, () => this.title.set(value.providerSessionId, "current")); }
-  async generateParent(value: Session, context: OrganizationExecutionContext) { await this.generate(`parent:${value.providerSessionId}`, context, () => this.parent.set(value.providerSessionId, "current")); }
+  async generateTitle(value: Session, context: OrganizationExecutionContext) {
+    this.titleSawLatestTrace &&= this.trace.get(`${value.providerSessionId}/turn-${value.providerSessionId}`) === "current";
+    await this.generate(`title:${value.providerSessionId}`, context, () => this.title.set(value.providerSessionId, "current"));
+  }
+  async generateParent(value: Session, context: OrganizationExecutionContext) {
+    this.parentSawLatestTitles &&= this.sessions.every((session) => this.title.get(session.providerSessionId) === "current");
+    await this.generate(`parent:${value.providerSessionId}`, context, () => this.parent.set(value.providerSessionId, "current"));
+  }
   reset() { this.title.clear(); this.parent.clear(); this.trace.clear(); this.calls.length = 0; }
   async generate(key: string, context: OrganizationExecutionContext, commit: () => void) {
     this.calls.push(key); this.concurrent += 1; this.maxConcurrent = Math.max(this.maxConcurrent, this.concurrent);

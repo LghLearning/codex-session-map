@@ -24,7 +24,7 @@ import {
 } from "../../../packages/semantic-store/src/index.ts";
 import type { Session, Turn } from "../../../packages/core/src/index.ts";
 import { materializeSessionForest, projectSessionBranches, type BranchTurn } from "../../../packages/forest/src/index.ts";
-import { OrganizationRepository, ProgressiveOrganizationService, type OrganizationItem } from "../../../packages/organizer/src/index.ts";
+import { OrganizationRepository, ProgressiveOrganizationService, type OrganizationItem, type WorkspaceOrganizationBaseSnapshot } from "../../../packages/organizer/src/index.ts";
 import { createLocalWebServer, type LocalWebEnvironment, type LocalWebForest, type LocalWebOrganizer, type LocalWebSemanticParents, type LocalWebSemanticTitles, type LocalWebSemanticTraces } from "./server.ts";
 import { WorkspaceSearchIndex } from "./search-index.ts";
 
@@ -117,8 +117,8 @@ async function createSemanticPreview(values: readonly string[], onOrganizationCo
       const feedback = (await Promise.all(traces.map((trace) => store.getUserFeedback(trace)))).filter((item) => item !== undefined);
       return assembleSemanticSessionTitleSource({ session, turns, traces, feedback });
     };
-    const parentContext = async (session: Session) => {
-      const sessions = (await listAllSessions(session.workspaceScopeId))
+    const parentContext = async (session: Session, snapshot?: WorkspaceOrganizationBaseSnapshot) => {
+      const sessions = (snapshot?.sessions ?? await listAllSessions(session.workspaceScopeId))
         .filter((candidate) => !candidate.excludedFromMainWorkspaceForest);
       const projections = await Promise.all(sessions.map(async (candidate) => {
         const title = await store.getSessionTitle(candidate.providerId, candidate.providerSessionId);
@@ -137,11 +137,11 @@ async function createSemanticPreview(values: readonly string[], onOrganizationCo
       }));
       const current = projections.find((projection) => projection.sessionId === session.providerSessionId);
       if (!current) throw new Error("Current Session is unavailable in its Workspace projection.");
-      const nativeLineage = await adapter.getNativeLineage(session.providerSessionId);
+      const nativeLineage = snapshot?.nativeLineageBySession.get(session.providerSessionId) ?? await adapter.getNativeLineage(session.providerSessionId);
       const candidates = selectSemanticParentCandidates({ current, sessions: projections, nativeLineage });
       const fingerprintProjection = async (projection: SemanticSessionProjection): Promise<SemanticSessionProjection> => ({
         ...projection,
-        sourceContentFingerprint: semanticSessionContentFingerprint(await listAllTurns(projection.sessionId)),
+        sourceContentFingerprint: semanticSessionContentFingerprint(snapshot?.turnsBySession.get(projection.sessionId) ?? await listAllTurns(projection.sessionId)),
       });
       const [fingerprintedCurrent, fingerprintedCandidates] = await Promise.all([
         fingerprintProjection(current),
@@ -183,25 +183,26 @@ async function createSemanticPreview(values: readonly string[], onOrganizationCo
       port: {
         listSessions: listAllSessions,
         listTurns: listAllTurns,
+        getNativeLineage: (sessionId) => adapter.getNativeLineage(sessionId),
         inspectTrace: async (turn) => {
           const lookup = await traceService.inspect(turn);
           return { freshness: lookup.freshness, sourceFingerprint: lookup.currentInputFingerprint, strategyVersion: identity(generator.identity) };
         },
         generateTrace: async (turn, context) => { await traceService.ensure(turn, { signal: context.signal, mayCommit: context.mayCommit, onMetrics: context.recordMetrics }); },
-        inspectTitle: async (session) => {
-          const lookup = await titleService.inspect(await titleSource(session, await listAllTurns(session.providerSessionId)));
+        inspectTitle: async (session, snapshot) => {
+          const lookup = await titleService.inspect(await titleSource(session, snapshot?.turnsBySession.get(session.providerSessionId) ?? await listAllTurns(session.providerSessionId)));
           return { freshness: lookup.freshness, sourceFingerprint: lookup.currentSourceFingerprint, strategyVersion: identity(titleGenerator.identity) };
         },
         generateTitle: async (session, context) => {
-          await titleService.generate(await titleSource(session, await listAllTurns(session.providerSessionId)), { signal: context.signal, mayCommit: context.mayCommit, onMetrics: context.recordMetrics });
+          await titleService.generate(await titleSource(session, context.snapshot.turnsBySession.get(session.providerSessionId) ?? []), { signal: context.signal, mayCommit: context.mayCommit, onMetrics: context.recordMetrics });
         },
-        inspectParent: async (session) => {
-          const context = await parentContext(session);
+        inspectParent: async (session, snapshot) => {
+          const context = await parentContext(session, snapshot);
           const lookup = await parentService.inspect(context.source);
           return { freshness: lookup.freshness, sourceFingerprint: lookup.currentSourceFingerprint, strategyVersion: identity(parentGenerator.identity) };
         },
         generateParent: async (session, execution) => {
-          const context = await parentContext(session);
+          const context = await parentContext(session, execution.snapshot);
           await parentService.generate(context.source, context.sessions, { signal: execution.signal, mayCommit: execution.mayCommit, onMetrics: execution.recordMetrics });
         },
         onCommitted: onOrganizationCommit,
