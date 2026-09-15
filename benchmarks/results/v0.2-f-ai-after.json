@@ -1,0 +1,62 @@
+{
+  "protocol": "v0.2-f-ai-v1",
+  "kind": "REAL_LOCAL_OLLAMA_SYNTHETIC_INPUT",
+  "measuredAt": "2026-09-15T01:18:46.687Z",
+  "environment": {
+    "platform": "win32",
+    "arch": "x64",
+    "node": "24.19.0",
+    "model": "qwen3.5@6488c96fa5faab64"
+  },
+  "sampleSize": {
+    "trace": 2,
+    "title": 1,
+    "parent": 1
+  },
+  "results": [
+    {
+      "operation": "trace",
+      "thermalState": "cold",
+      "totalMs": 14333.8724,
+      "inputChars": 2135,
+      "modelMs": 14332.6686,
+      "validationMs": 0.907999999999447,
+      "commitMs": 0,
+      "retryCount": 1,
+      "result": "success"
+    },
+    {
+      "operation": "trace",
+      "thermalState": "warm",
+      "totalMs": 4034.5607999999993,
+      "inputChars": 2135,
+      "modelMs": 4034.372000000001,
+      "validationMs": 0.11709999999948195,
+      "commitMs": 0,
+      "retryCount": 1,
+      "result": "success"
+    },
+    {
+      "operation": "title",
+      "thermalState": "warm",
+      "totalMs": 1056.5751000000018,
+      "inputChars": 632,
+      "modelMs": 1056.2227999999996,
+      "validationMs": 0,
+      "commitMs": 0,
+      "retryCount": 0,
+      "result": "success"
+    },
+    {
+      "operation": "parent",
+      "thermalState": "warm",
+      "totalMs": 3747.2692000000025,
+      "inputChars": 991,
+      "modelMs": 3746.664399999998,
+      "validationMs": 0.1981999999989057,
+      "commitMs": 0,
+      "retryCount": 0,
+      "result": "success"
+    }
+  ]
+}

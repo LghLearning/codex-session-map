@@ -89,7 +89,7 @@ const organizer = {
 
 const running = await createLocalWebServer({
   provider, semanticTitles, semanticParents, semanticTraces, forest, organizer, port: Number(process.argv[2] ?? 4323),
-  environment: { version: "0.1.0-alpha", readOnly: true, ollama: { endpoint: "http://127.0.0.1:11434", available: true, model: "qwen3.5", thinking: "off" }, semanticStore: { available: true, path: ".codex-session-map/semantic-traces.sqlite", schemaVersion: 4 } },
+  environment: { version: "0.1.0-alpha", readOnly: true, ollama: { endpoint: "http://127.0.0.1:11434", available: true, model: "qwen3.5", thinking: "off" }, semanticStore: { available: true, path: ".codex-session-map/semantic-traces.sqlite", schemaVersion: 5 } },
 }).start();
 console.log(`Sanitized release demo: ${running.url}`);
 for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, async () => { await running.close(); process.exit(0); });

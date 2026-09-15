@@ -38,13 +38,15 @@ History browsing, Forest data, and manual organization remain available when Oll
 
 ## Recent updates
 
+- The React Map Workspace is now the default `/` entry. Search and the Turn Reader locate and open exact native Turns; the previous Explorer remains available at `/legacy`.
 - Full Turn content now preserves long text, whitespace, and formatting independently of bounded previews. Displayed Turn numbers remain consecutive across pagination, and native Turn IDs support exact reads.
 - Derived fingerprints detect full-content changes, including text outside AI prompt samples. Older cached suggestions may appear stale after upgrading; stored suggestions and user values are retained.
 - User titles, Turn labels, and parent placement are persisted independently of AI records. Manual parent selection covers all legal Sessions in the Workspace, with time-direction and cycle checks.
 - Undo checks the current revision before restoring a previous user value. Restore automatic clears an override while retaining the AI suggestion. Ctrl+Z inside text inputs keeps the browser's text-editing behavior.
 - Forest trace content and counts update as generation completes, without reloading the page. Trace cards now follow the active color theme.
+- Organization progress is streamed over the existing SSE endpoint with revision protection; a low-frequency polling fallback remains for recovery. Node 24 is checked before tests, builds, and startup.
 
-Restart the server after updating. The application upgrades its local semantic database from schema 4 to 5 transactionally, preserving existing user titles, parent choices, trace edits, and review states. No Codex source database is modified.
+Restart the server after updating. The application upgrades its local semantic database to schema 5 transactionally, preserving existing user titles, parent choices, trace edits, and review states. No Codex source database is modified.
 
 ## Installation
 
@@ -146,7 +148,7 @@ Filesystem watchers reduce update latency. Periodic reconciliation remains the c
 
 ## Known limitations
 
-- This is `v0.1.0-alpha`, intended for local evaluation rather than unattended operation.
+- The package version remains `v0.1.0-alpha` while the unreleased v0.2 work is hardened; no beta tag or release is implied by the feature set.
 - Codex currently reports `openSession=false` and `openTurn=false`; the companion transcript and Copy Session ID are the supported fallback.
 - Semantic Parent inference can fail closed when the model returns a Session outside the candidate set. Rerunning retries only missing records.
 - Reparenting uses a dialog rather than drag-and-drop.
@@ -154,6 +156,7 @@ Filesystem watchers reduce update latency. Periodic reconciliation remains the c
 - When Ollama is offline, manual titles, labels, relationships, and Undo remain available. Generation is disabled; restart after restoring Ollama to enable it again.
 - Large cold Workspace materialization can take several seconds.
 - Workspace organization does not generate missing Turn Traces.
+- Search indexing is local and rebuildable. A first search on a new Workspace may show incomplete coverage while the index catches up.
 - Non-Windows watcher behavior is unverified.
 - Undo history starts with edits made through the new manual controls; pre-upgrade actions are not reconstructed as undoable history.
 
@@ -166,6 +169,6 @@ pnpm benchmark:transcript
 pnpm benchmark:reconciliation
 ```
 
-See [Architecture](docs/architecture.md) and [Source precedence](docs/source-precedence.md) for implementation details.
+See [Architecture](docs/architecture.md), [Source precedence](docs/source-precedence.md), and [Operations and recovery](docs/operations.md) for implementation and recovery details.
 
 This public repository starts from a privacy-reviewed source snapshot. Internal development history, real-session evaluation reports, local databases, user corrections, and private conversation content are deliberately excluded. The screenshot and test fixtures use synthetic demonstration data.
