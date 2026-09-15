@@ -27,6 +27,7 @@ import { materializeSessionForest, projectSessionBranches, type BranchTurn } fro
 import { OrganizationRepository, ProgressiveOrganizationService, type OrganizationItem, type WorkspaceOrganizationBaseSnapshot } from "../../../packages/organizer/src/index.ts";
 import { createLocalWebServer, type LocalWebEnvironment, type LocalWebForest, type LocalWebOrganizer, type LocalWebSemanticParents, type LocalWebSemanticTitles, type LocalWebSemanticTraces } from "./server.ts";
 import { WorkspaceSearchIndex } from "./search-index.ts";
+import { migrateTurnIdentityStores } from "./turn-identity-migration.ts";
 
 const PRODUCT_VERSION = "0.1.0-alpha";
 let semanticUnavailableReason: string | undefined;
@@ -42,6 +43,7 @@ const adapter = new CodexAdapterV1({
   appServerMode: args.includes("--spawn-app-server") ? "spawn" : "proxy",
   appServerExecutable: valueAfter(args, "--codex-bin"),
 });
+await migrateTurnIdentityStores(args, await adapter.listTurnIdentityAliases());
 const forestProjection = await createForestProjection(args);
 let search: WorkspaceSearchIndex | undefined;
 const semantic = await createSemanticPreview(args, (item) => { if (item.operation !== "parent") search?.refreshSession(item.sessionId); });

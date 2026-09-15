@@ -106,6 +106,39 @@ test("anchored Semantic Placement is atomic, persistent, undoable, and independe
   await store.close();
 });
 
+test("recovered Turn identity migration preserves traces, labels, anchors, and Undo history atomically", async () => {
+  const store = new SqliteSemanticTraceStore();
+  const oldLabel = "recovered:legacy-label";
+  const newLabel = "recovered:v2:new-label";
+  const oldAnchor = "recovered:legacy-anchor";
+  const newAnchor = "recovered:v2:new-anchor";
+  await store.put({ ...turn, nativeTurnId: oldLabel, text: "Stored trace", inputFingerprint: "input", generator: identity, generatedAt: "2026-01-01" });
+  store.overrides.write({ ...key("label"), nativeTurnId: oldLabel }, "workspace", { label: "Manual label" }, 0, sessions);
+  const parentKey = { ...key("parent"), nativeTurnId: undefined };
+  store.overrides.write(parentKey, "workspace", { relation: "subtask", parentSessionId: "a", anchorTurnId: oldAnchor }, 0, sessions);
+
+  const report = await store.migrateTurnIdentityReferences([
+    { providerId: "fixture", sessionId: "b", oldNativeTurnId: oldLabel, newNativeTurnId: newLabel },
+    { providerId: "fixture", sessionId: "a", oldNativeTurnId: oldAnchor, newNativeTurnId: newAnchor },
+  ]);
+  assert.equal(report.tracesMoved, 1);
+  assert.equal(report.overridesMoved, 1);
+  assert.equal(report.historyMoved, 1);
+  assert.equal(report.anchorsMoved, 2, "override and history anchor JSON are both migrated");
+  assert.equal((await store.get({ providerId: "fixture", sessionId: "b", nativeTurnId: oldLabel })), undefined);
+  assert.equal((await store.get({ providerId: "fixture", sessionId: "b", nativeTurnId: newLabel }))?.text, "Stored trace");
+  assert.equal(store.overrides.read({ ...key("label"), nativeTurnId: newLabel })?.value?.label, "Manual label");
+  assert.equal((await store.getSemanticParent("fixture", "b"))?.userAnchorTurnId, newAnchor);
+  await store.close();
+
+  const collision = new SqliteSemanticTraceStore();
+  await collision.put({ ...turn, nativeTurnId: oldLabel, text: "old", inputFingerprint: "old", generator: identity, generatedAt: "2026-01-01" });
+  await collision.put({ ...turn, nativeTurnId: newLabel, text: "new", inputFingerprint: "new", generator: identity, generatedAt: "2026-01-01" });
+  await assert.rejects(() => collision.migrateTurnIdentityReferences([{ providerId: "fixture", sessionId: "b", oldNativeTurnId: oldLabel, newNativeTurnId: newLabel }]), /collision/);
+  assert.equal((await collision.get({ providerId: "fixture", sessionId: "b", nativeTurnId: oldLabel }))?.text, "old", "collision rollback keeps the old row");
+  await collision.close();
+});
+
 test("manual parents cover more than AI Top-K, while future, self, workspace and cycle checks remain enforced", async () => {
   const store = new SqliteSemanticTraceStore();
   const values = [...Array.from({ length: 12 }, (_, i) => session(`parent-${i}`)), session("b", "2026-02-01T00:00:00Z"), session("future", "2026-03-01T00:00:00Z"), { ...session("other"), workspaceScopeId: "other" }];

@@ -6,6 +6,9 @@ import test from "node:test";
 import { CodexAdapterV1 } from "../src/adapter.ts";
 import { projectAppServerTurns } from "../src/app-server-source.ts";
 import { compactText } from "../src/internal.ts";
+import { legacyRecoveredTurnId } from "../src/turn-identity.ts";
+import { SqliteSemanticTraceStore } from "../../semantic-store/src/index.ts";
+import { migrateTurnIdentityStores } from "../../../apps/local-web/src/turn-identity-migration.ts";
 
 test("App Server preserves full message bodies while tool and list previews stay bounded", () => {
   const body = `  # 结果\n\n${"背景。".repeat(220)}\n\n\`\`\`ts\n  return 42;\n\`\`\`\n最终结论：采用方案 B。\n`;
@@ -120,6 +123,56 @@ test("native Turn identities survive adapter restart and physical archive reloca
   const after = await allPages((cursor) => afterAdapter.listTurns("session-modern", cursor));
   assert.deepEqual(after.map((turn) => turn.nativeTurnId), before.map((turn) => turn.nativeTurnId));
   assert.deepEqual(after.map((turn) => turn.displayOrdinal), before.map((turn) => turn.displayOrdinal));
+});
+
+test("recovered Turn identities do not depend on rollout path", async () => {
+  const home = await fixtureHome();
+  const beforeAdapter = new CodexAdapterV1({ codexHome: home, disableAppServer: true });
+  const before = await allPages((cursor) => beforeAdapter.listTurns("session-legacy", cursor));
+  assert.equal(before.every((turn) => turn.nativeTurnId.startsWith("recovered:v2:")), true);
+
+  const renamedDirectory = join(home, "sessions", "renamed");
+  await mkdir(renamedDirectory, { recursive: true });
+  await rename(join(home, "sessions", "2025", "12", "01", "rollout-legacy.jsonl"), join(renamedDirectory, "legacy-copy.jsonl"));
+
+  const afterAdapter = new CodexAdapterV1({ codexHome: home, disableAppServer: true });
+  const after = await allPages((cursor) => afterAdapter.listTurns("session-legacy", cursor));
+  assert.deepEqual(after.map((turn) => turn.nativeTurnId), before.map((turn) => turn.nativeTurnId));
+});
+
+test("identity migration resolves persisted pre-v2 references after archive relocation", async () => {
+  const home = await mkdtemp(join(tmpdir(), "codex-map-migration-"));
+  const activeDirectory = join(home, "sessions", "2026", "01", "01");
+  await mkdir(activeDirectory, { recursive: true });
+  const activePath = join(activeDirectory, "legacy.jsonl");
+  await writeFile(activePath, [
+    JSON.stringify({ type: "session_meta", payload: { id: "migration-session", cwd: "C:\\Migration" } }),
+    JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "legacy" } }),
+  ].join("\n") + "\n");
+  const oldNativeTurnId = legacyRecoveredTurnId(activePath, 2);
+  const semanticPath = join(home, "semantic.sqlite");
+  const beforeStore = new SqliteSemanticTraceStore(semanticPath);
+  await beforeStore.put({ providerId: "codex", sessionId: "migration-session", nativeTurnId: oldNativeTurnId, text: "legacy trace", inputFingerprint: "input", generator: { id: "fixture", version: "1", model: "test" }, generatedAt: "2026-01-01" });
+  await beforeStore.close();
+
+  const before = new CodexAdapterV1({ codexHome: home, disableAppServer: true });
+  const beforeTurn = (await allPages((cursor) => before.listTurns("migration-session", cursor)))[0]!;
+  const archivedPath = join(home, "archived_sessions", "legacy.jsonl");
+  await mkdir(join(home, "archived_sessions"), { recursive: true });
+  await rename(activePath, archivedPath);
+  const after = new CodexAdapterV1({ codexHome: home, disableAppServer: true });
+  const aliases = await after.listTurnIdentityAliases();
+  assert.equal(aliases.some((alias) => alias.newNativeTurnId === beforeTurn.nativeTurnId), true);
+  await migrateTurnIdentityStores([
+    "--semantic-store", semanticPath,
+    "--organization-store", join(home, "organization.sqlite"),
+    "--search-index", join(home, "search.sqlite"),
+  ], aliases);
+
+  const finalStore = new SqliteSemanticTraceStore(semanticPath);
+  assert.equal((await finalStore.get({ providerId: "codex", sessionId: "migration-session", nativeTurnId: beforeTurn.nativeTurnId }))?.text, "legacy trace");
+  assert.equal(await finalStore.get({ providerId: "codex", sessionId: "migration-session", nativeTurnId: oldNativeTurnId }), undefined);
+  await finalStore.close();
 });
 
 test("hidden agent sessions remain enumerable in diagnostics mode", async () => {

@@ -4,8 +4,9 @@ import { basename, join } from "node:path";
 import type { DiagnosticCollector } from "./diagnostics.ts";
 import type { CodexThreadRecord, CodexToolRecord, CodexTurnRecord, SourceSnapshot } from "./internal.ts";
 import { compactText, isRecord, stringValue } from "./internal.ts";
+import { digest, legacyRecoveredTurnId, recoveredTurnId, stableSegmentIdentity, type TurnIdentityAlias } from "./turn-identity.ts";
 
-const DECODER_VERSION = 1;
+const DECODER_VERSION = 2;
 const PROBE_BYTES = 4 * 1024;
 const MAX_LINE_BYTES = 16 * 1024 * 1024;
 
@@ -17,6 +18,7 @@ export interface RolloutCheckpoint {
   readonly headHash: string;
   readonly tailOffset: number;
   readonly tailHash: string;
+  readonly identityPrefixHash?: string;
 }
 
 export interface DecodedRecord {
@@ -27,6 +29,7 @@ export interface DecodedRecord {
 export interface DecodedRollout {
   readonly records: readonly DecodedRecord[];
   readonly checkpoint: RolloutCheckpoint;
+  readonly identityPrefixHash: string;
   readonly mode: "full" | "append";
   readonly partialTail: boolean;
 }
@@ -42,6 +45,7 @@ interface Segment {
   readonly records: readonly DecodedRecord[];
   readonly partial: boolean;
   readonly sessionId: string;
+  readonly segmentIdentity: string;
 }
 
 export class RolloutCodexSource {
@@ -79,7 +83,7 @@ export class RolloutCodexSource {
         }
         for (const sessionId of ids) {
           const segments = this.#segments.get(sessionId) ?? [];
-          segments.push({ path, archived: root.archived, records: decoded.records, partial: decoded.partialTail, sessionId });
+          segments.push({ path, archived: root.archived, records: decoded.records, partial: decoded.partialTail, sessionId, segmentIdentity: stableSegmentIdentity(sessionId, decoded.identityPrefixHash) });
           this.#segments.set(sessionId, segments);
         }
       }
@@ -101,7 +105,7 @@ export class RolloutCodexSource {
       for (const path of knownPaths) {
         try {
           const decoded = await decodeRollout(path, undefined, this.#options.diagnostics);
-          segments.push({ path, archived: path.toLocaleLowerCase("en-US").includes("archived_sessions"), records: decoded.records, partial: decoded.partialTail, sessionId });
+          segments.push({ path, archived: path.toLocaleLowerCase("en-US").includes("archived_sessions"), records: decoded.records, partial: decoded.partialTail, sessionId, segmentIdentity: stableSegmentIdentity(sessionId, decoded.identityPrefixHash) });
         } catch {
           this.#options.diagnostics.add({ code: "corrupt_line", severity: "error", message: "A registered rollout could not be decoded.", sessionId, sourceKey: basename(path) });
         }
@@ -113,6 +117,12 @@ export class RolloutCodexSource {
 
   segmentCount(sessionId: string): number {
     return this.#segments.get(sessionId)?.length ?? 0;
+  }
+
+  listTurnIdentityAliases(): readonly TurnIdentityAlias[] {
+    const aliases: TurnIdentityAlias[] = [];
+    for (const [sessionId, segments] of this.#segments) projectRolloutTurns(sessionId, segments.slice().sort(compareSegments), this.#options.diagnostics, aliases);
+    return aliases;
   }
 }
 
@@ -132,6 +142,9 @@ export async function decodeRollout(path: string, checkpoint: RolloutCheckpoint 
     const lines = committed.toString("utf8").split("\n");
     lines.pop();
     const records: DecodedRecord[] = [];
+    let firstMetaHash: string | undefined;
+    let firstBoundaryHash: string | undefined;
+    let firstCommittedRecordHash: string | undefined;
     for (const [index, raw] of lines.entries()) {
       const ordinal = baseLine + index + 1;
       const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
@@ -143,6 +156,10 @@ export async function decodeRollout(path: string, checkpoint: RolloutCheckpoint 
       try {
         const value: unknown = JSON.parse(line);
         if (!isRecord(value)) throw new Error("record is not an object");
+        const rawHash = digest([line]);
+        firstCommittedRecordHash ??= rawHash;
+        if (!firstMetaHash && value.type === "session_meta") firstMetaHash = rawHash;
+        if (!firstBoundaryHash && isLegacyBoundary(value)) firstBoundaryHash = rawHash;
         records.push({ ordinal, value });
       } catch {
         diagnostics.add({ code: "corrupt_line", severity: "warning", message: "A malformed committed rollout line was skipped.", sourceKey: basename(path), ordinal });
@@ -153,10 +170,12 @@ export async function decodeRollout(path: string, checkpoint: RolloutCheckpoint 
     const head = await readWindow(handle, 0, Math.min(PROBE_BYTES, observedEof));
     const tailOffset = Math.max(0, observedEof - PROBE_BYTES);
     const tail = await readWindow(handle, tailOffset, observedEof - tailOffset);
+    const identityPrefixHash = checkpoint?.identityPrefixHash ?? digest([firstMetaHash ?? firstCommittedRecordHash ?? "empty", firstBoundaryHash ?? "empty"]);
     return {
       records,
       mode: append ? "append" : "full",
       partialTail,
+      identityPrefixHash,
       checkpoint: {
         decoderVersion: DECODER_VERSION,
         observedEof,
@@ -165,6 +184,7 @@ export async function decodeRollout(path: string, checkpoint: RolloutCheckpoint 
         headHash: hash(head),
         tailOffset,
         tailHash: hash(tail),
+        identityPrefixHash,
       },
     };
   } finally {
@@ -248,7 +268,7 @@ interface MutableTurn {
   issues: string[];
 }
 
-function projectRolloutTurns(sessionId: string, segments: readonly Segment[], diagnostics: DiagnosticCollector): CodexTurnRecord[] {
+function projectRolloutTurns(sessionId: string, segments: readonly Segment[], diagnostics: DiagnosticCollector, aliases?: TurnIdentityAlias[]): CodexTurnRecord[] {
   const turns = new Map<string, MutableTurn>();
   let currentId: string | undefined;
   let currentIsNative = false;
@@ -263,32 +283,32 @@ function projectRolloutTurns(sessionId: string, segments: readonly Segment[], di
       if (outerType === "session_meta" || outerType === "turn_context") continue;
       if (outerType === "event_msg") {
         if (eventType === "task_started") {
-          currentId = stringValue(payload.turn_id) ?? recoveredTurnId(segment.path, record.ordinal);
+          currentId = stringValue(payload.turn_id) ?? recoveredTurnId(sessionId, segment.segmentIdentity, record.ordinal);
           currentIsNative = Boolean(stringValue(payload.turn_id));
           ensureTurn(currentId, time, false);
         } else if (eventType === "task_complete") {
-          const turn = ensureTurn(stringValue(payload.turn_id) ?? currentId ?? recoveredTurnId(segment.path, record.ordinal), time, true);
+          const turn = ensureTurn(stringValue(payload.turn_id) ?? currentId ?? recoveredTurnId(sessionId, segment.segmentIdentity, record.ordinal), time, true);
           turn.status = /fail|error/i.test(String(payload.status ?? "")) ? "failed" : "completed";
           turn.completedAtMs = time;
           turn.assistantFinal = stringValue(payload.last_agent_message) ?? turn.assistantFinal;
           currentId = undefined;
           currentIsNative = false;
         } else if (eventType === "turn_aborted" || eventType === "task_aborted") {
-          const turn = ensureTurn(stringValue(payload.turn_id) ?? currentId ?? recoveredTurnId(segment.path, record.ordinal), time, true);
+          const turn = ensureTurn(stringValue(payload.turn_id) ?? currentId ?? recoveredTurnId(sessionId, segment.segmentIdentity, record.ordinal), time, true);
           turn.status = "interrupted";
           turn.completedAtMs = time;
           currentId = undefined;
           currentIsNative = false;
         } else if (eventType === "user_message") {
           const current = currentId ? turns.get(currentId) : undefined;
-          const turn = currentId && (currentIsNative || !current?.inputText) ? ensureTurn(currentId, time, false) : startLegacy(segment.path, record, time);
+          const turn = currentId && (currentIsNative || !current?.inputText) ? ensureTurn(currentId, time, false) : startLegacy(segment, record, time);
           turn.inputText = stringValue(payload.message ?? payload.text) ?? turn.inputText;
           turn.initiator = "user";
         } else if (eventType === "agent_message") {
-          const turn = ensureTurn(currentId ?? recoveredTurnId(segment.path, record.ordinal), time, true);
+          const turn = ensureTurn(currentId ?? recoveredTurnId(sessionId, segment.segmentIdentity, record.ordinal), time, true);
           turn.assistantFinal = stringValue(payload.message ?? payload.text) ?? turn.assistantFinal;
         } else if (/error|failed/.test(eventType)) {
-          const turn = ensureTurn(currentId ?? recoveredTurnId(segment.path, record.ordinal), time, true);
+          const turn = ensureTurn(currentId ?? recoveredTurnId(sessionId, segment.segmentIdentity, record.ordinal), time, true);
           turn.status = "failed";
           turn.completedAtMs = time;
         } else if (!KNOWN_EVENT_MESSAGES.has(eventType)) {
@@ -298,8 +318,8 @@ function projectRolloutTurns(sessionId: string, segments: readonly Segment[], di
         const isUserMessage = payload.type === "message" && payload.role === "user";
         const current = currentId ? turns.get(currentId) : undefined;
         const turn = isUserMessage && (!currentId || (!currentIsNative && Boolean(current?.inputText)))
-          ? startLegacy(segment.path, record, time)
-          : ensureTurn(currentId ?? recoveredTurnId(segment.path, record.ordinal), time, true);
+          ? startLegacy(segment, record, time)
+          : ensureTurn(currentId ?? recoveredTurnId(sessionId, segment.segmentIdentity, record.ordinal), time, true);
         projectResponseItem(payload, turn, toolOwners);
       } else if (!KNOWN_OUTER_TYPES.has(outerType)) {
         diagnostics.add({ code: "unknown_event", severity: "info", message: `Unknown rollout event type: ${outerType || "<missing>"}.`, sessionId, sourceKey: basename(segment.path), ordinal: record.ordinal });
@@ -326,14 +346,16 @@ function projectRolloutTurns(sessionId: string, segments: readonly Segment[], di
     return turn;
   }
 
-  function startLegacy(path: string, record: DecodedRecord, time: number | undefined): MutableTurn {
+  function startLegacy(segment: Segment, record: DecodedRecord, time: number | undefined): MutableTurn {
     if (currentId) {
       const previous = turns.get(currentId);
       if (previous?.status === "in_progress") previous.status = "partial";
     }
-    currentId = recoveredTurnId(path, record.ordinal);
+    currentId = recoveredTurnId(sessionId, segment.segmentIdentity, record.ordinal);
     currentIsNative = false;
-    return ensureTurn(currentId, time, true);
+    const turn = ensureTurn(currentId, time, true);
+    aliases?.push({ providerId: "codex", sessionId, oldNativeTurnId: legacyRecoveredTurnId(segment.path, record.ordinal), newNativeTurnId: currentId, displayOrdinal: turn.ordinal, boundaryRecordOrdinal: record.ordinal });
+    return turn;
   }
 
   return [...turns.values()].sort((a, b) => a.ordinal - b.ordinal).map((turn) => ({
@@ -432,10 +454,6 @@ function eventTimestamp(value: Record<string, unknown>): number | undefined {
   return undefined;
 }
 
-function recoveredTurnId(path: string, ordinal: number): string {
-  return `recovered:${hash(Buffer.from(path)).slice(0, 12)}:${ordinal}`;
-}
-
 function summarize(value: unknown): string | undefined {
   if (typeof value === "string") return compactText(value);
   try {
@@ -457,6 +475,12 @@ function unique(values: readonly string[]): string[] {
 
 function hash(value: Buffer): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function isLegacyBoundary(value: Record<string, unknown>): boolean {
+  const payload = isRecord(value.payload) ? value.payload : value;
+  return value.type === "event_msg" && payload.type === "user_message"
+    || value.type === "response_item" && payload.type === "message" && payload.role === "user";
 }
 
 const KNOWN_EVENT_MESSAGES = new Set([

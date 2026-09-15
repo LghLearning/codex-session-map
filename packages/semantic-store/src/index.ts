@@ -9,7 +9,7 @@ import type {
   SessionProvider,
 } from "../../core/src/index.ts";
 import type { SemanticParentEdge, SemanticParentRelation, SemanticParentStore } from "./semantic-parent.ts";
-import { UserOverrides, migrateUserOverrides } from "./user-overrides.ts";
+import { UserOverrides, migrateUserOverrides, type UserValue } from "./user-overrides.ts";
 export * from "./user-overrides.ts";
 
 export * from "./prompt-generator.ts";
@@ -21,6 +21,21 @@ export * from "./semantic-parent.ts";
 export const SEMANTIC_STORE_SCHEMA_VERSION = 5;
 
 export type SemanticTraceUserVerdict = "accepted" | "edited" | "rejected";
+
+export interface TurnIdentityMigration {
+  readonly providerId: string;
+  readonly sessionId: string;
+  readonly oldNativeTurnId: string;
+  readonly newNativeTurnId: string;
+}
+
+export interface TurnIdentityMigrationReport {
+  readonly tracesMoved: number;
+  readonly feedbackMoved: number;
+  readonly overridesMoved: number;
+  readonly historyMoved: number;
+  readonly anchorsMoved: number;
+}
 
 /** Authoritative user feedback. Unlike AI traces, this is not disposable derived cache. */
 export interface SemanticTraceUserFeedback extends TurnIdentity {
@@ -121,6 +136,7 @@ export interface SemanticTraceStore extends DerivedStoreLifecycle, SemanticParen
   getSessionTitle(providerId: string, sessionId: string): Promise<SemanticSessionTitle | undefined>;
   putGeneratedSessionTitle(title: SemanticSessionTitle): Promise<void>;
   putUserSessionTitle(providerId: string, sessionId: string, userTitle: string, userEditedAt: string): Promise<void>;
+  migrateTurnIdentityReferences(mappings: readonly TurnIdentityMigration[]): Promise<TurnIdentityMigrationReport>;
 }
 
 export class SqliteSemanticTraceStore implements SemanticTraceStore {
@@ -250,6 +266,28 @@ export class SqliteSemanticTraceStore implements SemanticTraceStore {
 
   async putUserSessionTitle(providerId: string, sessionId: string, userTitle: string, userEditedAt: string): Promise<void> {
     this.overrides.write({ providerId, sessionId, field: "title" }, "", { title: normalizeSemanticSessionTitle(userTitle) });
+  }
+
+  async migrateTurnIdentityReferences(mappings: readonly TurnIdentityMigration[]): Promise<TurnIdentityMigrationReport> {
+    const unique = [...new Map(mappings.map((mapping) => [`${mapping.providerId}\0${mapping.sessionId}\0${mapping.oldNativeTurnId}`, mapping])).values()]
+      .filter((mapping) => mapping.oldNativeTurnId !== mapping.newNativeTurnId);
+    const report = { tracesMoved: 0, feedbackMoved: 0, overridesMoved: 0, historyMoved: 0, anchorsMoved: 0 };
+    if (!unique.length) return report;
+    this.#database.exec("BEGIN IMMEDIATE");
+    try {
+      for (const mapping of unique) {
+        report.tracesMoved += migratePrimaryTurnId(this.#database, "turn_semantic_traces", mapping);
+        report.feedbackMoved += migratePrimaryTurnId(this.#database, "turn_semantic_trace_feedback", mapping);
+        report.overridesMoved += migrateOverrideTurnId(this.#database, mapping);
+        report.historyMoved += migrateHistoryTurnId(this.#database, mapping);
+        report.anchorsMoved += migrateAnchorValues(this.#database, mapping);
+      }
+      this.#database.exec("COMMIT");
+      return report;
+    } catch (error) {
+      this.#database.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   async getSemanticParent(providerId: string, childSessionId: string): Promise<SemanticParentEdge | undefined> {
@@ -637,6 +675,59 @@ export function preferredSessionDisplayTitle(originalTitle: string, title?: Pick
 
 function turnIdentity(turn: Turn): TurnIdentity {
   return { providerId: turn.providerId, sessionId: turn.sessionId, nativeTurnId: turn.nativeTurnId };
+}
+
+function migratePrimaryTurnId(db: DatabaseSync, table: "turn_semantic_traces" | "turn_semantic_trace_feedback", mapping: TurnIdentityMigration): number {
+  const oldRow = db.prepare(`SELECT 1 FROM ${table} WHERE provider_id=? AND session_id=? AND native_turn_id=?`).get(mapping.providerId, mapping.sessionId, mapping.oldNativeTurnId);
+  if (!oldRow) return 0;
+  const newRow = db.prepare(`SELECT 1 FROM ${table} WHERE provider_id=? AND session_id=? AND native_turn_id=?`).get(mapping.providerId, mapping.sessionId, mapping.newNativeTurnId);
+  if (newRow) throw new Error(`Turn identity migration collision in ${table}.`);
+  return db.prepare(`UPDATE ${table} SET native_turn_id=? WHERE provider_id=? AND session_id=? AND native_turn_id=?`)
+    .run(mapping.newNativeTurnId, mapping.providerId, mapping.sessionId, mapping.oldNativeTurnId).changes;
+}
+
+function migrateOverrideTurnId(db: DatabaseSync, mapping: TurnIdentityMigration): number {
+  const oldRow = db.prepare("SELECT 1 FROM user_overrides WHERE provider_id=? AND session_id=? AND native_turn_id=? AND field='label'")
+    .get(mapping.providerId, mapping.sessionId, mapping.oldNativeTurnId);
+  if (!oldRow) return 0;
+  const newRow = db.prepare("SELECT 1 FROM user_overrides WHERE provider_id=? AND session_id=? AND native_turn_id=? AND field='label'")
+    .get(mapping.providerId, mapping.sessionId, mapping.newNativeTurnId);
+  if (newRow) throw new Error("Turn identity migration collision in user_overrides.");
+  return db.prepare("UPDATE user_overrides SET native_turn_id=? WHERE provider_id=? AND session_id=? AND native_turn_id=? AND field='label'")
+    .run(mapping.newNativeTurnId, mapping.providerId, mapping.sessionId, mapping.oldNativeTurnId).changes;
+}
+
+function migrateHistoryTurnId(db: DatabaseSync, mapping: TurnIdentityMigration): number {
+  return db.prepare("UPDATE user_edit_history SET native_turn_id=? WHERE provider_id=? AND session_id=? AND native_turn_id=? AND field='label'")
+    .run(mapping.newNativeTurnId, mapping.providerId, mapping.sessionId, mapping.oldNativeTurnId).changes;
+}
+
+function migrateAnchorValues(db: DatabaseSync, mapping: TurnIdentityMigration): number {
+  let changes = 0;
+  const overrides = db.prepare("SELECT provider_id,session_id,native_turn_id,field,value_json FROM user_overrides WHERE field='parent'").all() as { provider_id: string; session_id: string; native_turn_id: string; field: string; value_json: string }[];
+  for (const row of overrides) {
+    const next = replaceAnchor(row.value_json, mapping);
+    if (next === undefined) continue;
+    db.prepare("UPDATE user_overrides SET value_json=? WHERE provider_id=? AND session_id=? AND native_turn_id=? AND field='parent'")
+      .run(next, row.provider_id, row.session_id, row.native_turn_id);
+    changes += 1;
+  }
+  const history = db.prepare("SELECT id,before_json,after_json FROM user_edit_history WHERE field='parent'").all() as { id: string; before_json: string; after_json: string }[];
+  for (const row of history) {
+    const before = replaceAnchor(row.before_json, mapping) ?? row.before_json;
+    const after = replaceAnchor(row.after_json, mapping) ?? row.after_json;
+    if (before === row.before_json && after === row.after_json) continue;
+    db.prepare("UPDATE user_edit_history SET before_json=?,after_json=? WHERE id=?").run(before, after, row.id);
+    changes += 1;
+  }
+  return changes;
+}
+
+function replaceAnchor(raw: string, mapping: TurnIdentityMigration): string | undefined {
+  let value: UserValue | null;
+  try { value = JSON.parse(raw) as UserValue | null; } catch { throw new Error("Turn identity migration encountered invalid user JSON."); }
+  if (!value || value.parentSessionId !== mapping.sessionId || value.anchorTurnId !== mapping.oldNativeTurnId) return undefined;
+  return JSON.stringify({ ...value, anchorTurnId: mapping.newNativeTurnId });
 }
 
 function sameGenerator(left: SemanticGeneratorIdentity, right: SemanticGeneratorIdentity): boolean {

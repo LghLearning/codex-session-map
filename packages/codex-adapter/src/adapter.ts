@@ -17,6 +17,7 @@ import { detectCodexEnvironment, type CodexEnvironment } from "./environment.ts"
 import type { CodexProjectRecord, CodexThreadRecord, CodexTurnRecord, SourceSnapshot } from "./internal.ts";
 import { canonicalizeWorkspacePath } from "./path-canonicalizer.ts";
 import { RolloutCodexSource } from "./rollout-source.ts";
+import type { TurnIdentityAlias } from "./turn-identity.ts";
 import { StructuredCodexSource } from "./sqlite-source.ts";
 import { CodexUpdateMonitor, type SourceInvalidationReason } from "./update-monitor.ts";
 
@@ -49,6 +50,7 @@ export class CodexAdapterV1 implements SessionProvider, LiveSessionProvider {
   #appServer?: AppServerSource;
   #structured?: StructuredCodexSource;
   #rollout?: RolloutCodexSource;
+  #turnIdentityAliases?: Promise<readonly TurnIdentityAlias[]>;
   #loadPromise?: Promise<void>;
   #monitor?: CodexUpdateMonitor;
   #revision = 0;
@@ -97,7 +99,18 @@ export class CodexAdapterV1 implements SessionProvider, LiveSessionProvider {
   }
 
   async readTurn(sessionId: string, nativeTurnId: string): Promise<Turn | undefined> {
-    return (await this.#readTurns(sessionId)).find((turn) => turn.nativeTurnId === nativeTurnId);
+    const turns = await this.#readTurns(sessionId);
+    const direct = turns.find((turn) => turn.nativeTurnId === nativeTurnId);
+    if (direct) return direct;
+    const alias = (await this.listTurnIdentityAliases()).find((item) => item.sessionId === sessionId && item.oldNativeTurnId === nativeTurnId);
+    return alias ? turns.find((turn) => turn.nativeTurnId === alias.newNativeTurnId) : undefined;
+  }
+
+  /** Returns a rebuildable compatibility map for pre-v2 recovered IDs. */
+  async listTurnIdentityAliases(): Promise<readonly TurnIdentityAlias[]> {
+    await this.#ensureLoaded();
+    if (!this.#turnIdentityAliases) this.#turnIdentityAliases = Promise.resolve(this.#rollout?.listTurnIdentityAliases() ?? []);
+    return this.#turnIdentityAliases;
   }
 
   async #readTurns(sessionId: string): Promise<readonly Turn[]> {
@@ -137,12 +150,14 @@ export class CodexAdapterV1 implements SessionProvider, LiveSessionProvider {
       appServer: this.#appServer,
       structured: this.#structured,
       rollout: this.#rollout,
+      turnIdentityAliases: this.#turnIdentityAliases,
       diagnostics: this.#diagnostics,
     };
     this.#state = undefined;
     this.#appServer = undefined;
     this.#structured = undefined;
     this.#rollout = undefined;
+    this.#turnIdentityAliases = undefined;
     this.#diagnostics = new DiagnosticCollector();
     try {
       await this.#ensureLoaded();
@@ -151,6 +166,7 @@ export class CodexAdapterV1 implements SessionProvider, LiveSessionProvider {
       this.#appServer = previous.appServer;
       this.#structured = previous.structured;
       this.#rollout = previous.rollout;
+      this.#turnIdentityAliases = previous.turnIdentityAliases;
       this.#diagnostics = previous.diagnostics;
       throw error;
     }

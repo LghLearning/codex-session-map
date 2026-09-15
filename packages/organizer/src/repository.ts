@@ -1,5 +1,39 @@
 import { DatabaseSync } from "node:sqlite";
+import { existsSync } from "node:fs";
 import type { OrganizationCounts, OrganizationItem, OrganizationItemStatus, OrganizationJob, OrganizationJobStatus, OrganizationMetricDelta, OrganizationMode, OrganizationOperation, OrganizationRequest } from "./types.ts";
+
+export interface OrganizationTurnIdentityMigration {
+  readonly providerId: string;
+  readonly sessionId: string;
+  readonly oldNativeTurnId: string;
+  readonly newNativeTurnId: string;
+}
+
+/**
+ * Rewrites only app-owned queued/completed organization references. The
+ * adapter remains the source of truth; this table is disposable job state.
+ */
+export function migrateOrganizationTurnReferences(databasePath: string, mappings: readonly OrganizationTurnIdentityMigration[]): number {
+  if (!existsSync(databasePath) || !mappings.length) return 0;
+  const db = new DatabaseSync(databasePath);
+  try {
+    const hasItems = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='organization_items'").get());
+    if (!hasItems) return 0;
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const update = db.prepare("UPDATE organization_items SET native_turn_id=? WHERE session_id=? AND native_turn_id=?");
+      let moved = 0;
+      for (const mapping of mappings) moved += Number(update.run(mapping.newNativeTurnId, mapping.sessionId, mapping.oldNativeTurnId).changes ?? 0);
+      db.exec("COMMIT");
+      return moved;
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  } finally {
+    db.close();
+  }
+}
 
 export class OrganizationRepository {
   readonly #db: DatabaseSync;
