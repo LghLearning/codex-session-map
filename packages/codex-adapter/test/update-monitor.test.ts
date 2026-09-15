@@ -3,7 +3,13 @@ import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { CodexUpdateMonitor, type SourceInvalidationReason } from "../src/update-monitor.ts";
+import { CodexUpdateMonitor, resolveWatchPath, type SourceInvalidationReason } from "../src/update-monitor.ts";
+
+test("watch path resolution canonicalizes Windows paths and preserves fallbacks", () => {
+  assert.equal(resolveWatchPath("C:\\Users\\USER~1\\AppData\\Local\\Temp", "win32", () => "C:\\Users\\User\\AppData\\Local\\Temp"), "C:\\Users\\User\\AppData\\Local\\Temp");
+  assert.equal(resolveWatchPath("C:\\watch-root", "win32", () => { throw new Error("unavailable"); }), "C:\\watch-root");
+  assert.equal(resolveWatchPath("/tmp/watch-root", "linux", () => { throw new Error("must not resolve"); }), "/tmp/watch-root");
+});
 
 test("filesystem hints are debounced and periodic reconciliation remains a fallback", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "codex-session-map-monitor-"));

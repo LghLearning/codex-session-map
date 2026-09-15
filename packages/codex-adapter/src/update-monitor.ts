@@ -1,8 +1,21 @@
-import { watch, type FSWatcher } from "node:fs";
+import { realpathSync, watch, type FSWatcher } from "node:fs";
 import { basename, dirname } from "node:path";
 
 export type SourceInvalidationReason = "source_change" | "periodic_reconciliation";
 export const DEFAULT_RECONCILIATION_INTERVAL_MS = 300_000;
+
+export function resolveWatchPath(
+  directory: string,
+  platform: NodeJS.Platform = process.platform,
+  resolveNativePath: (path: string) => string = realpathSync.native,
+): string {
+  if (platform !== "win32") return directory;
+  try {
+    return resolveNativePath(directory);
+  } catch {
+    return directory;
+  }
+}
 
 export interface CodexUpdateMonitorOptions {
   readonly sessionsDirectory: string;
@@ -58,7 +71,7 @@ export class CodexUpdateMonitor {
   #watchDirectory(directory: string, recursive: boolean, exactFile?: string): void {
     try {
       const exactName = exactFile ? basename(exactFile) : undefined;
-      const watcher = watch(directory, { recursive }, (_event, filename) => {
+      const watcher = watch(resolveWatchPath(directory), { recursive }, (_event, filename) => {
         if (exactName && filename && !String(filename).startsWith(exactName)) return;
         this.#queue("source_change", this.#options.debounceMs ?? 350);
       });
