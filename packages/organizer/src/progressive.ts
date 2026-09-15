@@ -35,6 +35,7 @@ export class ProgressiveOrganizationService {
   get(jobId: string): OrganizationJob | undefined { return this.#repository.getJob(jobId); }
   latest(workspaceId: string): OrganizationJob | undefined { return this.#repository.latest(workspaceId); }
   items(jobId: string): readonly OrganizationItem[] { return this.#repository.listItems(jobId); }
+  subscribe(listener: (job: OrganizationJob) => void): () => void { return this.#repository.subscribe(listener); }
 
   pause(jobId: string): OrganizationJob {
     const job = this.#require(jobId);

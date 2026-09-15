@@ -16,6 +16,7 @@ export type OrganizationStatus = "queued" | "running" | "pausing" | "paused" | "
 export interface OrganizationJobView {
   id: string; workspaceId: string; mode: OrganizationMode; sessionId?: string; status: OrganizationStatus;
   createdAt: string; startedAt?: string; updatedAt: string; completedAt?: string; error?: string;
+  revision: number;
   lastCommitted?: { sessionId: string; nativeTurnId?: string; operation: "trace" | "title" | "parent"; completedAt?: string };
   counts: { planned: number; queued: number; running: number; generated: number; reused: number; failed: number; canceled: number; stale: number; byOperation: Record<"trace" | "title" | "parent", { planned: number; completed: number; generated: number; reused: number; failed: number }> };
 }
@@ -44,6 +45,9 @@ export async function getSessionDetail(sessionId: string, signal?: AbortSignal):
     api(`/api/sessions/${encoded}/semantic-parent`, { signal }), api(`/api/sessions/${encoded}/user-overrides/parent`, { signal }),
   ]);
   return { session: session.session, semanticTitle: title.semanticTitle, semanticParent: parent.semanticParent, parentOverride: override.override };
+}
+export async function getSessionTitle(sessionId: string, signal?: AbortSignal): Promise<any> {
+  return (await api(`/api/sessions/${encodeURIComponent(sessionId)}/semantic-title`, { signal })).semanticTitle;
 }
 export async function getTurnDetail(sessionId: string, nativeTurnId: string, signal?: AbortSignal): Promise<any> {
   return (await api(`/api/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(nativeTurnId)}`, { signal })).turn;

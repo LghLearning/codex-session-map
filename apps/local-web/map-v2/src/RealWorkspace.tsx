@@ -1,6 +1,6 @@
 import { Background, Controls, MiniMap, ReactFlow, useNodesState, useReactFlow, type Connection, type NodeMouseHandler, type Viewport } from "@xyflow/react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { getBootstrap, getForest, getManualParents, getOverride, getSessionDetail, getTurnDetail, getTurnDirectory, latestEdit, undoEdit, writeOverride, writePlacement, type Bootstrap } from "./api.ts";
+import { getBootstrap, getForest, getManualParents, getOverride, getSessionDetail, getSessionTitle, getTurnDetail, getTurnDirectory, latestEdit, undoEdit, writeOverride, writePlacement, type Bootstrap, type OrganizationJobView } from "./api.ts";
 import { buildMapGraph, flattenSessions } from "./graph.ts";
 import { SectionNode, SessionNode, TurnNode } from "./nodes.tsx";
 import { connectionToPlacement, type PlacementDraft } from "./placement.ts";
@@ -11,6 +11,7 @@ import { useWorkspaceSearch } from "./search/useWorkspaceSearch.ts";
 import { resolveSearchNavigation } from "./search/navigation.ts";
 import { TurnReader } from "./reader/TurnReader.tsx";
 import { OrganizationControl } from "./organization/OrganizationControl.tsx";
+import { patchSessionTitle } from "./map-updates.ts";
 
 const nodeTypes = { session: SessionNode, turn: TurnNode, section: SectionNode };
 const MAX_EXPANDED = 12;
@@ -40,6 +41,8 @@ export default function RealWorkspace() {
   const [lastEdit, setLastEdit] = useState<any>();
   const [forestError, setForestError] = useState("");
   const [loading, setLoading] = useState(true);
+  const [organizationProgress, setOrganizationProgress] = useState<OrganizationJobView>();
+  const [eventConnectionRevision, setEventConnectionRevision] = useState(0);
   const search = useWorkspaceSearch(workspace, Boolean(bootstrap?.search?.available));
 
   const reloadForest = useCallback(async (targetWorkspace: string, signal?: AbortSignal) => {
@@ -61,6 +64,11 @@ export default function RealWorkspace() {
       throw error;
     }
   }, []);
+  const reloadSessionTitle = useCallback(async (sessionId: string) => {
+    const semanticTitle = await getSessionTitle(sessionId);
+    setForest((current) => patchSessionTitle(current, sessionId, semanticTitle?.displayTitle));
+    if (selection?.sessionId === sessionId) setDetail((current: any) => current ? { ...current, semanticTitle } : current);
+  }, [selection?.sessionId]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -120,6 +128,11 @@ export default function RealWorkspace() {
       void reloadForest(workspace);
       for (const sessionId of expandedRef.current) void reloadTurnDirectory(sessionId).catch(() => undefined);
     });
+    events.addEventListener("organization-progress", (event) => {
+      const next = JSON.parse((event as MessageEvent).data) as OrganizationJobView;
+      if (next.workspaceId === workspace) setOrganizationProgress((current) => !current || next.id !== current.id || next.revision > current.revision ? next : current);
+    });
+    events.addEventListener("ready", () => setEventConnectionRevision((value) => value + 1));
     events.addEventListener("error", () => setNotice("Live updates reconnecting…"));
     return () => events.close();
   }, [bootstrap, workspace, reloadForest, reloadTurnDirectory]);
@@ -221,7 +234,9 @@ export default function RealWorkspace() {
       const value = field === "title" ? { title: draft.value } : { label: draft.value };
       const result = await writeOverride(sessionId, field, value, current.override.revision, selection.kind === "turn" ? selection.nativeTurnId : undefined);
       setLastEdit(result.edit); setDraft(undefined); setNotice(`${field === "title" ? "Session renamed" : "Turn label updated"} · Undo available`);
-      await reloadForest(workspace); if (selection.kind === "turn") await reloadTurnDirectory(sessionId); setDetail(selection.kind === "turn" ? await getTurnDetail(sessionId, selection.nativeTurnId) : await getSessionDetail(sessionId));
+      if (field === "title") setForest((current) => patchSessionTitle(current, sessionId, result.semanticTitle?.displayTitle));
+      if (selection.kind === "turn") await reloadTurnDirectory(sessionId);
+      setDetail(selection.kind === "turn" ? await getTurnDetail(sessionId, selection.nativeTurnId) : await getSessionDetail(sessionId));
     } catch (error) { setNotice((error as Error).message); }
   }
   async function restoreAutomatic(field: "title" | "label" | "parent") {
@@ -229,7 +244,9 @@ export default function RealWorkspace() {
     try {
       const current = await getOverride(selection.sessionId, field, selection.kind === "turn" ? selection.nativeTurnId : undefined);
       const result = await writeOverride(selection.sessionId, field, null, current.override.revision, selection.kind === "turn" ? selection.nativeTurnId : undefined);
-      setLastEdit(result.edit); setNotice("Automatic suggestion restored · Undo available"); await reloadForest(workspace);
+      setLastEdit(result.edit); setNotice("Automatic suggestion restored · Undo available");
+      if (field === "title") setForest((current) => patchSessionTitle(current, selection.sessionId, result.semanticTitle?.displayTitle));
+      if (field === "parent") await reloadForest(workspace);
       if (selection.kind === "turn") await reloadTurnDirectory(selection.sessionId);
       setDetail(selection.kind === "turn" ? await getTurnDetail(selection.sessionId, selection.nativeTurnId) : await getSessionDetail(selection.sessionId));
     } catch (error) { setNotice((error as Error).message); }
@@ -247,7 +264,7 @@ export default function RealWorkspace() {
       <select aria-label="Workspace" value={workspace} onChange={(event) => void switchWorkspace(event.target.value)}>{bootstrap?.scopes.map((scope) => <option key={scope.id} value={scope.id}>{scope.displayName}</option>)}</select>
       <SearchPanel query={search.query} setQuery={search.setQuery} results={search.page?.results ?? []} index={search.index} loading={search.loading} error={search.error} nextCursor={search.page?.nextCursor} loadMore={() => void search.loadMore()} onSelect={selectSearchResult} />
       <div className="view-tabs"><button className="active" type="button">Map</button><a href={legacyHref}>List</a></div>
-      <OrganizationControl workspace={workspace} available={Boolean(bootstrap?.organizer?.available)} selectedSessionId={selection?.sessionId} expandedSessionIds={[...expanded]} onNotice={setNotice} onProgress={(item) => { if (item?.operation === "trace") { if (expandedRef.current.has(item.sessionId)) void reloadTurnDirectory(item.sessionId).catch(() => undefined); } else void reloadForest(workspace); }} />
+      <OrganizationControl workspace={workspace} available={Boolean(bootstrap?.organizer?.available)} selectedSessionId={selection?.sessionId} expandedSessionIds={[...expanded]} liveJob={organizationProgress} connectionRevision={eventConnectionRevision} onNotice={setNotice} onComplete={() => { void reloadForest(workspace); for (const sessionId of expandedRef.current) void reloadTurnDirectory(sessionId).catch(() => undefined); }} onProgress={(item) => { if (item?.operation === "trace") { if (expandedRef.current.has(item.sessionId)) void reloadTurnDirectory(item.sessionId).catch(() => undefined); } else if (item?.operation === "title") void reloadSessionTitle(item.sessionId).catch(() => undefined); else void reloadForest(workspace); }} />
       <button type="button" className="subtle" onClick={() => void performUndo()}>Undo</button>
     </header>
     <aside className="workspace-rail">

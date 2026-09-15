@@ -58,6 +58,20 @@ test("runtime metrics persist planning and per-operation timing without changing
   repository.close();
 });
 
+test("progress subscribers receive monotonically increasing authoritative Job revisions", async () => {
+  const fixture = new FixturePort(); fixture.title.set("b", "current"); fixture.parent.set("b", "current");
+  const { service, repository } = setup(fixture);
+  const revisions: number[] = [];
+  const unsubscribe = service.subscribe((job) => revisions.push(job.revision));
+  const started = await service.start({ workspaceId: "workspace", mode: "quick" });
+  await waitFor(service, started.id, "completed");
+  unsubscribe();
+  assert.ok(revisions.length > 2);
+  assert.deepEqual(revisions, revisions.slice().sort((a, b) => a - b));
+  assert.equal(new Set(revisions).size, revisions.length);
+  repository.close();
+});
+
 test("one failed item does not stop later items and retry executes only failed work", async () => {
   const fixture = new FixturePort(); fixture.failOnce.add("title:a");
   const { service, repository } = setup(fixture);

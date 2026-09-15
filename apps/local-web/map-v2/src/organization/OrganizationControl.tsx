@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { controlOrganization, getLatestOrganization, getOrganization, getOrganizationItems, startOrganization, type OrganizationItemView, type OrganizationJobView, type OrganizationMode } from "../api.ts";
+import { acceptsOrganizationProgress, ORGANIZATION_POLL_FALLBACK_MS } from "./progress.ts";
 
 const ACTIVE = new Set(["queued", "running", "pausing", "canceling"]);
 
@@ -9,32 +10,49 @@ export function OrganizationControl(props: {
   selectedSessionId?: string;
   expandedSessionIds: readonly string[];
   onProgress(item?: OrganizationJobView["lastCommitted"]): void;
+  onComplete(): void;
   onNotice(message: string): void;
+  liveJob?: OrganizationJobView;
+  connectionRevision: number;
 }) {
   const [job, setJob] = useState<OrganizationJobView>();
   const [open, setOpen] = useState(false);
   const [failures, setFailures] = useState<OrganizationItemView[]>([]);
   const lastGenerated = useRef(0);
   const callback = useRef(props.onProgress);
+  const completeCallback = useRef(props.onComplete);
+  const lastRevision = useRef(0);
+  const status = useRef<OrganizationJobView["status"] | undefined>(undefined);
   callback.current = props.onProgress;
+  completeCallback.current = props.onComplete;
+
+  const accept = useCallback((next: OrganizationJobView) => {
+    if (!acceptsOrganizationProgress(job, next, props.workspace)) return;
+    const previousStatus = status.current;
+    lastRevision.current = next.revision; status.current = next.status;
+    if (next.counts.generated !== lastGenerated.current) { lastGenerated.current = next.counts.generated; callback.current(next.lastCommitted); }
+    setJob(next);
+    if (previousStatus && ACTIVE.has(previousStatus) && !ACTIVE.has(next.status)) completeCallback.current();
+  }, [job, props.workspace]);
 
   useEffect(() => {
     if (!props.workspace || !props.available) { setJob(undefined); return; }
     let disposed = false;
-    void getLatestOrganization(props.workspace).then((value) => { if (!disposed) { setJob(value); lastGenerated.current = value?.counts.generated ?? 0; } }).catch(() => undefined);
+    void getLatestOrganization(props.workspace).then((value) => { if (!disposed) { setJob(value); lastGenerated.current = value?.counts.generated ?? 0; lastRevision.current = value?.revision ?? 0; status.current = value?.status; } }).catch(() => undefined);
     return () => { disposed = true; };
-  }, [props.workspace, props.available]);
+  }, [props.workspace, props.available, props.connectionRevision]);
+
+  useEffect(() => { if (props.liveJob) accept(props.liveJob); }, [props.liveJob, accept]);
 
   useEffect(() => {
     if (!job || !ACTIVE.has(job.status)) return;
     let disposed = false;
     const timer = setInterval(() => void getOrganization(job.id).then((next) => {
       if (disposed) return;
-      if (next.counts.generated !== lastGenerated.current) { lastGenerated.current = next.counts.generated; callback.current(next.lastCommitted); }
-      setJob(next);
-    }).catch((error) => props.onNotice((error as Error).message)), 600);
+      accept(next);
+    }).catch((error) => props.onNotice((error as Error).message)), ORGANIZATION_POLL_FALLBACK_MS);
     return () => { disposed = true; clearInterval(timer); };
-  }, [job?.id, job?.status]);
+  }, [job?.id, job?.status, accept]);
 
   async function start(mode: OrganizationMode, sessionOnly = false, staleOnly = false) {
     try {
@@ -42,13 +60,13 @@ export function OrganizationControl(props: {
         mode, sessionId: sessionOnly ? props.selectedSessionId : undefined,
         selectedSessionId: props.selectedSessionId, expandedSessionIds: props.expandedSessionIds, staleOnly,
       });
-      lastGenerated.current = next.counts.generated; setJob(next); setOpen(true);
+      lastGenerated.current = next.counts.generated; lastRevision.current = next.revision; status.current = next.status; setJob(next); setOpen(true);
     } catch (error) { props.onNotice((error as Error).message); }
   }
 
   async function control(action: "pause" | "resume" | "cancel" | "retry") {
     if (!job) return;
-    try { setJob(await controlOrganization(job.id, action)); }
+    try { accept(await controlOrganization(job.id, action)); }
     catch (error) { props.onNotice((error as Error).message); }
   }
 

@@ -44,7 +44,7 @@ const adapter = new CodexAdapterV1({
 });
 const forestProjection = await createForestProjection(args);
 let search: WorkspaceSearchIndex | undefined;
-const semantic = await createSemanticPreview(args, (item) => search?.refreshSession(item.sessionId));
+const semantic = await createSemanticPreview(args, (item) => { if (item.operation !== "parent") search?.refreshSession(item.sessionId); });
 search = await createSearchIndex(args, semantic?.store);
 const app = createLocalWebServer({
   provider: adapter,
@@ -220,6 +220,7 @@ async function createSemanticPreview(values: readonly string[], onOrganizationCo
       get: (id) => organizationService.get(id), latest: (workspaceId) => organizationService.latest(workspaceId), items: (id) => organizationService.items(id),
       pause: (id) => organizationService.pause(id), resume: (id) => organizationService.resume(id), cancel: (id) => organizationService.cancel(id),
       retryFailed: (id) => organizationService.retryFailed(id), shutdown: () => organizationService.shutdown(),
+      subscribeProgress: (listener) => organizationService.subscribe(listener),
     };
     return {
       store,

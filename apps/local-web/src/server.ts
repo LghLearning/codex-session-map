@@ -118,6 +118,7 @@ export interface LocalWebOrganizer {
   resume?(jobId: string): OrganizationJob;
   cancel?(jobId: string): OrganizationJob;
   retryFailed?(jobId: string): OrganizationJob;
+  subscribeProgress?(listener: (job: OrganizationJob) => void): () => void;
   shutdown?(): void | Promise<void>;
   organize?(scopeId: string, options: { signal: AbortSignal; onProgress(progress: WorkspaceOrganizationProgress): void }): Promise<WorkspaceOrganizationResult>;
 }
@@ -227,7 +228,9 @@ async function handleApi(options: LocalWebServerOptions, request: IncomingMessag
       const session = await provider.readSession(edit.sessionId);
       if (session.providerId !== edit.providerId) throw new UserEditError("Manual change provider mismatch.");
       const sessions = await loadManualSessions(provider, session.workspaceScopeId);
-      return sendJson(response, 200, { edit: store.overrides.undo(edit.id, requireRevision(body.revision), session.workspaceScopeId, sessions) });
+      const undone = store.overrides.undo(edit.id, requireRevision(body.revision), session.workspaceScopeId, sessions);
+      if (edit.field !== "parent") options.search?.refreshSession(edit.sessionId);
+      return sendJson(response, 200, { edit: undone });
     }
     const session = await provider.readSession(decodePathPart((overrideMatch ?? manualCandidatesMatch)![1]));
     if (manualCandidatesMatch) {
@@ -448,7 +451,7 @@ async function handleApi(options: LocalWebServerOptions, request: IncomingMessag
     return sendJson(response, 200, { items });
   }
   if (url.pathname === "/api/events") {
-    if (!provider.subscribeUpdates) return sendProblem(response, 501, "live_updates_unavailable", "This provider does not expose live updates.");
+    if (!provider.subscribeUpdates && !options.organizer?.subscribeProgress) return sendProblem(response, 501, "live_updates_unavailable", "This runtime does not expose live updates.");
     response.statusCode = 200;
     response.setHeader("Content-Type", "text/event-stream; charset=utf-8");
     response.setHeader("Cache-Control", "no-store");
@@ -456,9 +459,12 @@ async function handleApi(options: LocalWebServerOptions, request: IncomingMessag
     response.flushHeaders();
     eventResponses.add(response);
     response.write("event: ready\ndata: {}\n\n");
-    const unsubscribe = await provider.subscribeUpdates((update) => {
+    const unsubscribe = provider.subscribeUpdates ? await provider.subscribeUpdates((update) => {
       options.search?.reconcileUpdate(update);
       if (!response.destroyed) response.write(`event: snapshot\ndata: ${JSON.stringify(update)}\n\n`);
+    }) : () => undefined;
+    const unsubscribeOrganization = options.organizer?.subscribeProgress?.((job) => {
+      if (!response.destroyed) response.write(`event: organization-progress\ndata: ${JSON.stringify(job)}\n\n`);
     });
     const heartbeat = setInterval(() => { if (!response.destroyed) response.write(": keep-alive\n\n"); }, 15_000);
     heartbeat.unref();
@@ -466,6 +472,7 @@ async function handleApi(options: LocalWebServerOptions, request: IncomingMessag
       clearInterval(heartbeat);
       eventResponses.delete(response);
       unsubscribe();
+      unsubscribeOrganization?.();
     });
     return;
   }

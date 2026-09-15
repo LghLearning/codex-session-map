@@ -5,7 +5,7 @@ import type { NativeLineage, Page, SemanticTraceLookup, Session, SessionProvider
 import { createLocalWebServer, type LocalWebProvider, type LocalWebSemanticParentResult, type LocalWebSemanticParents, type LocalWebSemanticTitleRecord, type LocalWebSemanticTitles, type LocalWebSemanticTraces } from "../src/server.ts";
 import { materializeSessionForest } from "../../../packages/forest/src/index.ts";
 import { SqliteSemanticTraceStore } from "../../../packages/semantic-store/src/index.ts";
-import type { WorkspaceOrganizationProgress, WorkspaceOrganizationResult } from "../../../packages/organizer/src/index.ts";
+import type { OrganizationJob, WorkspaceOrganizationProgress, WorkspaceOrganizationResult } from "../../../packages/organizer/src/index.ts";
 
 const scope: WorkspaceScope = {
   id: "cwd:scope/a",
@@ -270,6 +270,8 @@ test("local web API is loopback-only, paginated, read-only, and provider-neutral
   assert.match(await readEvent(reader), /event: ready/);
   provider.emit({ revision: 1, reason: "source_change", occurredAt: "2026-01-01T00:00:00.000Z" });
   assert.match(await readEvent(reader), /"revision":1/);
+  organizer.emitProgress(2);
+  assert.match(await readEvent(reader), /event: organization-progress[\s\S]*"revision":2/);
   eventAbort.abort();
 });
 
@@ -355,6 +357,13 @@ test("offline model blocks generation but preserves semantic reading and correct
 
 class FakeOrganizer {
   calls = 0;
+  readonly listeners = new Set<(job: OrganizationJob) => void>();
+  subscribeProgress(listener: (job: OrganizationJob) => void) { this.listeners.add(listener); return () => this.listeners.delete(listener); }
+  emitProgress(revision: number) {
+    const empty = { planned: 0, completed: 0, generated: 0, reused: 0, failed: 0 };
+    const job: OrganizationJob = { id: "fixture-job", workspaceId: scope.id, mode: "quick", status: "running", createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:01.000Z", requestedBy: "test", runToken: 0, revision, planningMs: 1, snapshotPreparationMs: 1, counts: { planned: 0, queued: 0, running: 0, generated: 0, reused: 0, failed: 0, canceled: 0, stale: 0, byOperation: { trace: empty, title: empty, parent: empty } } };
+    for (const listener of this.listeners) listener(job);
+  }
   async organize(_scopeId: string, options: { signal: AbortSignal; onProgress(progress: WorkspaceOrganizationProgress): void }): Promise<WorkspaceOrganizationResult> {
     this.calls += 1;
     const result: WorkspaceOrganizationResult = {

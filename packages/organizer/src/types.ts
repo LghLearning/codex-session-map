@@ -27,6 +27,7 @@ export interface OrganizationJob {
   readonly completedAt?: string;
   readonly requestedBy: string;
   readonly runToken: number;
+  readonly revision: number;
   readonly error?: string;
   readonly planningMs: number;
   readonly snapshotPreparationMs: number;
