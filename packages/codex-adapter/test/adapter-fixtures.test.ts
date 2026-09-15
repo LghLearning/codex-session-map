@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { cp, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
@@ -106,6 +106,20 @@ test("rollout fallback satisfies C1 session, segment, turn, archive and hidden-a
   assert.equal(adapter.getDiagnostics().some((item) => item.code === "multi_segment_session" && item.sessionId === "session-modern"), true);
   assert.equal(adapter.getDiagnostics().some((item) => item.code === "partial_line"), true);
   assert.equal(adapter.getDiagnostics().some((item) => item.code === "unknown_event"), true);
+});
+
+test("native Turn identities survive adapter restart and physical archive relocation", async () => {
+  const home = await fixtureHome();
+  const beforeAdapter = new CodexAdapterV1({ codexHome: home, disableAppServer: true });
+  const before = await allPages((cursor) => beforeAdapter.listTurns("session-modern", cursor));
+  const active = join(home, "sessions", "2026", "01", "01", "rollout-modern-a.jsonl");
+  const archived = join(home, "archived_sessions", "rollout-modern-a.jsonl");
+  await rename(active, archived);
+
+  const afterAdapter = new CodexAdapterV1({ codexHome: home, disableAppServer: true });
+  const after = await allPages((cursor) => afterAdapter.listTurns("session-modern", cursor));
+  assert.deepEqual(after.map((turn) => turn.nativeTurnId), before.map((turn) => turn.nativeTurnId));
+  assert.deepEqual(after.map((turn) => turn.displayOrdinal), before.map((turn) => turn.displayOrdinal));
 });
 
 test("hidden agent sessions remain enumerable in diagnostics mode", async () => {
