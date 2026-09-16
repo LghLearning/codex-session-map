@@ -1,6 +1,7 @@
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, renameSync, unlinkSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
-import { dirname } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { isRecord } from "./internal.ts";
 
 const REGISTRY_SCHEMA_VERSION = 1;
 
@@ -45,16 +46,13 @@ export class RolloutSourceRegistry {
   constructor(databasePath: string) {
     this.#databasePath = databasePath;
     mkdirSync(dirname(databasePath), { recursive: true });
-    const db = new DatabaseSync(databasePath);
-    try { configure(db); ensureSchema(db); }
-    finally { db.close(); }
+    const db = openDatabase(databasePath);
+    db.close();
   }
 
   reconcile(files: readonly RolloutRegistryFileInput[]): void {
-    const db = new DatabaseSync(this.#databasePath);
+    const db = openDatabase(this.#databasePath);
     try {
-      configure(db);
-      ensureSchema(db);
       db.exec("BEGIN IMMEDIATE");
       try {
         const ids = files.map((file) => file.registryFileId);
@@ -115,10 +113,8 @@ export class RolloutSourceRegistry {
   }
 
   snapshot(): readonly RolloutRegistryFileState[] {
-    const db = new DatabaseSync(this.#databasePath);
+    const db = openDatabase(this.#databasePath);
     try {
-      configure(db);
-      ensureSchema(db);
       const rows = db.prepare("SELECT * FROM rollout_files ORDER BY canonical_path").all() as unknown as FileRow[];
       const sessions = db.prepare("SELECT registry_file_id,session_id,stable_segment_identity,segment_order FROM rollout_file_sessions ORDER BY segment_order,session_id").all() as unknown as SessionRow[];
       const byFile = new Map<string, RolloutRegistrySessionInput[]>();
@@ -152,12 +148,80 @@ export class RolloutSourceRegistry {
   }
 }
 
+// SQLite result codes: SQLITE_CORRUPT=11, SQLITE_SCHEMA=17, SQLITE_NOTADB=26.
+// I/O codes such as SQLITE_FULL, SQLITE_CANTOPEN, and SQLITE_READONLY are not recoverable cache corruption.
+const REGISTRY_RECOVERY_ERROR_CODES = new Set([11, 17, 26]);
+const MAX_QUARANTINED_REGISTRIES = 3;
+
+function openDatabase(databasePath: string): DatabaseSync {
+  let db: DatabaseSync | undefined;
+  try {
+    db = new DatabaseSync(databasePath);
+    configure(db);
+    ensureSchema(db);
+    return db;
+  } catch (error) {
+    try { db?.close(); } catch { /* The failed handle may already be closed. */ }
+    if (!isRecoverableRegistryError(error)) throw error;
+    quarantine(databasePath);
+    const rebuilt = new DatabaseSync(databasePath);
+    try {
+      configure(rebuilt);
+      ensureSchema(rebuilt);
+      return rebuilt;
+    } catch (rebuildError) {
+      try { rebuilt.close(); } catch { /* Preserve the rebuild error. */ }
+      throw rebuildError;
+    }
+  }
+}
+
+function isRecoverableRegistryError(error: unknown): boolean {
+  if (error instanceof RegistrySchemaError) return true;
+  if (!isRecord(error) || error.code !== "ERR_SQLITE_ERROR") return false;
+  return typeof error.errcode === "number" && REGISTRY_RECOVERY_ERROR_CODES.has(error.errcode & 0xff);
+}
+
+function quarantine(databasePath: string): void {
+  const stamp = String(Date.now());
+  const quarantineBase = `${databasePath}.corrupt-${stamp}`;
+  for (const suffix of ["", "-wal", "-shm"]) {
+    const source = `${databasePath}${suffix}`;
+    if (existsSync(source)) renameSync(source, `${quarantineBase}${suffix}`);
+  }
+  pruneQuarantined(databasePath);
+}
+
+function pruneQuarantined(databasePath: string): void {
+  const directory = dirname(databasePath);
+  const prefix = `${basename(databasePath)}.corrupt-`;
+  const stems = [...new Set(readdirSync(directory)
+    .filter((name) => name.startsWith(prefix))
+    .map((name) => name.endsWith("-wal") || name.endsWith("-shm") ? name.slice(0, -4) : name))]
+    .sort()
+    .reverse();
+  for (const stem of stems.slice(MAX_QUARANTINED_REGISTRIES)) {
+    for (const suffix of ["", "-wal", "-shm"]) {
+      const path = join(directory, `${stem}${suffix}`);
+      if (existsSync(path)) unlinkSync(path);
+    }
+  }
+}
+
+class RegistrySchemaError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RegistrySchemaError";
+  }
+}
+
 function configure(db: DatabaseSync): void {
   db.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=3000");
 }
 
 function ensureSchema(db: DatabaseSync): void {
   db.exec("CREATE TABLE IF NOT EXISTS registry_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  assertColumns(db, "registry_meta", ["key", "value"]);
   const current = db.prepare("SELECT value FROM registry_meta WHERE key='schema_version'").get() as { value: string } | undefined;
   if (current && Number(current.value) !== REGISTRY_SCHEMA_VERSION) {
     db.exec("DROP TABLE IF EXISTS rollout_file_sessions; DROP TABLE IF EXISTS rollout_files; DELETE FROM registry_meta WHERE key='schema_version'");
@@ -181,7 +245,13 @@ function ensureSchema(db: DatabaseSync): void {
       source_stamp TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
-    CREATE INDEX IF NOT EXISTS rollout_files_root ON rollout_files(root_kind);
+  `);
+  assertColumns(db, "rollout_files", [
+    "registry_file_id", "canonical_path", "root_kind", "stable_file_identity", "size", "mtime_ms", "decoder_version",
+    "observed_eof", "committed_offset", "physical_line_count", "head_hash", "tail_offset", "tail_hash",
+    "identity_prefix_hash", "source_stamp", "updated_at",
+  ]);
+  db.exec(`
     CREATE TABLE IF NOT EXISTS rollout_file_sessions (
       registry_file_id TEXT NOT NULL REFERENCES rollout_files(registry_file_id) ON DELETE CASCADE,
       session_id TEXT NOT NULL,
@@ -189,9 +259,17 @@ function ensureSchema(db: DatabaseSync): void {
       segment_order INTEGER NOT NULL,
       PRIMARY KEY(registry_file_id,session_id)
     );
-    CREATE INDEX IF NOT EXISTS rollout_file_sessions_session ON rollout_file_sessions(session_id);
   `);
+  assertColumns(db, "rollout_file_sessions", ["registry_file_id", "session_id", "stable_segment_identity", "segment_order"]);
+  db.exec("CREATE INDEX IF NOT EXISTS rollout_files_root ON rollout_files(root_kind); CREATE INDEX IF NOT EXISTS rollout_file_sessions_session ON rollout_file_sessions(session_id);");
   db.prepare("INSERT INTO registry_meta(key,value) VALUES('schema_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(String(REGISTRY_SCHEMA_VERSION));
+}
+
+function assertColumns(db: DatabaseSync, table: string, required: readonly string[]): void {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as { name?: unknown }[];
+  const names = new Set(columns.map((column) => column.name).filter((name): name is string => typeof name === "string"));
+  const missing = required.filter((name) => !names.has(name));
+  if (missing.length) throw new RegistrySchemaError(`Registry table ${table} is missing required columns.`);
 }
 
 interface FileRow {

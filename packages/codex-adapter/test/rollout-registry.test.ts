@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readdir, writeFile } from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -35,6 +35,52 @@ test("rollout registry is rebuildable metadata, preserves relocation identity, a
 
   registry.reconcile([relocated]);
   assert.equal(registry.snapshot().length, 1, "deleting a source is represented by rebuilding the derived snapshot");
+});
+
+test("corrupted registry is quarantined and rebuilt without swallowing other failures", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "codex-rollout-registry-corrupt-"));
+  const databasePath = join(directory, "source-registry.sqlite");
+  await writeFile(databasePath, Buffer.from("not a sqlite database"));
+
+  const registry = new RolloutSourceRegistry(databasePath);
+  registry.reconcile([file("file:v1:recovered", "C:\\Codex\\sessions\\recovered.jsonl", [])]);
+  assert.equal(registry.snapshot().length, 1);
+  assert.equal((await readdir(directory)).some((name) => name.startsWith("source-registry.sqlite.corrupt-")), true);
+});
+
+test("valid SQLite with an incompatible registry schema is quarantined and rebuilt", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "codex-rollout-registry-schema-"));
+  const databasePath = join(directory, "source-registry.sqlite");
+  const database = new DatabaseSync(databasePath);
+  database.exec("CREATE TABLE rollout_files (registry_file_id TEXT PRIMARY KEY)");
+  database.close();
+
+  const registry = new RolloutSourceRegistry(databasePath);
+  registry.reconcile([file("file:v1:schema-recovered", "C:\\Codex\\sessions\\schema-recovered.jsonl", [])]);
+  assert.equal(registry.snapshot().length, 1);
+  assert.equal((await readdir(directory)).some((name) => name.startsWith("source-registry.sqlite.corrupt-")), true);
+});
+
+test("schema version mismatch resets the derived registry for the next source reconcile", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "codex-rollout-registry-version-"));
+  const databasePath = join(directory, "source-registry.sqlite");
+  const registry = new RolloutSourceRegistry(databasePath);
+  registry.reconcile([file("file:v1:versioned", "C:\\Codex\\sessions\\versioned.jsonl", [])]);
+
+  const database = new DatabaseSync(databasePath);
+  database.prepare("UPDATE registry_meta SET value=? WHERE key=?").run("999", "schema_version");
+  database.close();
+
+  const reset = new RolloutSourceRegistry(databasePath);
+  assert.equal(reset.snapshot().length, 0);
+  reset.reconcile([file("file:v1:versioned", "C:\\Codex\\sessions\\versioned.jsonl", [])]);
+  assert.equal(reset.snapshot().length, 1);
+});
+
+test("non-corruption SQLite I/O failures remain visible", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "codex-rollout-registry-io-"));
+  assert.throws(() => new RolloutSourceRegistry(directory), /unable to open database file/i);
+  assert.equal((await readdir(directory)).some((name) => name.includes(".corrupt-")), false);
 });
 
 function file(registryFileId: string, canonicalPath: string, sessions: RolloutRegistryFileInput["sessions"]): RolloutRegistryFileInput {
