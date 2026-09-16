@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { cp, mkdir, mkdtemp, readFile, rename, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
@@ -9,6 +9,7 @@ import { compactText } from "../src/internal.ts";
 import { legacyRecoveredTurnId } from "../src/turn-identity.ts";
 import { SqliteSemanticTraceStore } from "../../semantic-store/src/index.ts";
 import { migrateTurnIdentityStores } from "../../../apps/local-web/src/turn-identity-migration.ts";
+import { RolloutSourceRegistry } from "../src/rollout-registry.ts";
 
 test("App Server preserves full message bodies while tool and list previews stay bounded", () => {
   const body = `  # 结果\n\n${"背景。".repeat(220)}\n\n\`\`\`ts\n  return 42;\n\`\`\`\n最终结论：采用方案 B。\n`;
@@ -173,6 +174,22 @@ test("identity migration resolves persisted pre-v2 references after archive relo
   assert.equal((await finalStore.get({ providerId: "codex", sessionId: "migration-session", nativeTurnId: beforeTurn.nativeTurnId }))?.text, "legacy trace");
   assert.equal(await finalStore.get({ providerId: "codex", sessionId: "migration-session", nativeTurnId: oldNativeTurnId }), undefined);
   await finalStore.close();
+});
+
+test("adapter rebuilds a source registry from rollout metadata without storing decoded records", async () => {
+  const home = await fixtureHome();
+  const registryPath = join(await mkdtemp(join(tmpdir(), "codex-map-registry-")), "source-registry.sqlite");
+  const adapter = new CodexAdapterV1({ codexHome: home, disableAppServer: true, sourceRegistryPath: registryPath });
+  await adapter.listWorkspaceScopes();
+  const first = new RolloutSourceRegistry(registryPath).snapshot();
+  assert.equal(first.length > 0, true);
+  assert.equal(first.every((file) => file.sessions.length > 0), true);
+  assert.equal(first.every((file) => !Object.hasOwn(file, "records")), true);
+
+  await rm(registryPath, { force: true });
+  const rebuiltAdapter = new CodexAdapterV1({ codexHome: home, disableAppServer: true, sourceRegistryPath: registryPath });
+  await rebuiltAdapter.listWorkspaceScopes();
+  assert.equal(new RolloutSourceRegistry(registryPath).snapshot().length, first.length, "deleting the registry must be recoverable from Codex source");
 });
 
 test("hidden agent sessions remain enumerable in diagnostics mode", async () => {

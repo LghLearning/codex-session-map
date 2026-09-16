@@ -33,6 +33,8 @@ export interface CodexAdapterOptions {
   readonly watchDebounceMs?: number;
   readonly reconciliationIntervalMs?: number;
   readonly disableFilesystemWatch?: boolean;
+  /** App-owned rebuildable rollout source registry. Disabled when omitted. */
+  readonly sourceRegistryPath?: string;
 }
 
 interface MaterializedState {
@@ -213,7 +215,7 @@ export class CodexAdapterV1 implements SessionProvider, LiveSessionProvider {
   async #load(): Promise<void> {
     const environment = await this.getEnvironment();
     this.#structured = new StructuredCodexSource({ codexHome: environment.codexHome, diagnostics: this.#diagnostics, stateDatabase: environment.stateDatabase, historyDatabase: environment.historyDatabase });
-    this.#rollout = new RolloutCodexSource({ codexHome: environment.codexHome, diagnostics: this.#diagnostics });
+    this.#rollout = new RolloutCodexSource({ codexHome: environment.codexHome, diagnostics: this.#diagnostics, registryPath: this.#options.sourceRegistryPath });
 
     let primary: SourceSnapshot = { threads: [], projects: [] };
     if (!this.#options.disableAppServer && environment.appServerExecutable) {

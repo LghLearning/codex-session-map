@@ -42,6 +42,7 @@ const adapter = new CodexAdapterV1({
   disableAppServer: args.includes("--no-app-server"),
   appServerMode: args.includes("--spawn-app-server") ? "spawn" : "proxy",
   appServerExecutable: valueAfter(args, "--codex-bin"),
+  sourceRegistryPath: resolve(valueAfter(args, "--source-registry") ?? ".codex-session-map/source-registry.sqlite"),
 });
 await migrateTurnIdentityStores(args, await adapter.listTurnIdentityAliases());
 const forestProjection = await createForestProjection(args);

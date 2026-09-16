@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
-import { open, readdir } from "node:fs/promises";
+import { open, readdir, stat } from "node:fs/promises";
 import { basename, join } from "node:path";
 import type { DiagnosticCollector } from "./diagnostics.ts";
 import type { CodexThreadRecord, CodexToolRecord, CodexTurnRecord, SourceSnapshot } from "./internal.ts";
 import { compactText, isRecord, stringValue } from "./internal.ts";
-import { digest, legacyRecoveredTurnId, recoveredTurnId, stableSegmentIdentity, type TurnIdentityAlias } from "./turn-identity.ts";
+import { digest, legacyRecoveredTurnId, recoveredTurnId, stableRolloutFileIdentity, stableSegmentIdentity, type TurnIdentityAlias } from "./turn-identity.ts";
+import { RolloutSourceRegistry, type RolloutRegistryFileInput } from "./rollout-registry.ts";
 
 const DECODER_VERSION = 2;
 const PROBE_BYTES = 4 * 1024;
@@ -37,6 +38,7 @@ export interface DecodedRollout {
 export interface RolloutSourceOptions {
   readonly codexHome: string;
   readonly diagnostics: DiagnosticCollector;
+  readonly registryPath?: string;
 }
 
 interface Segment {
@@ -46,18 +48,22 @@ interface Segment {
   readonly partial: boolean;
   readonly sessionId: string;
   readonly segmentIdentity: string;
+  readonly registryFileId: string;
 }
 
 export class RolloutCodexSource {
   readonly #options: RolloutSourceOptions;
   readonly #segments = new Map<string, Segment[]>();
+  readonly #registry?: RolloutSourceRegistry;
 
   constructor(options: RolloutSourceOptions) {
     this.#options = options;
+    this.#registry = options.registryPath ? new RolloutSourceRegistry(options.registryPath) : undefined;
   }
 
   async list(): Promise<SourceSnapshot> {
     this.#segments.clear();
+    const registryFiles = new Map<string, { path: string; archived: boolean; decoded: DecodedRollout; sessionIds: Set<string>; registryFileId: string }>();
     const roots = [
       { path: join(this.#options.codexHome, "sessions"), archived: false },
       { path: join(this.#options.codexHome, "archived_sessions"), archived: true },
@@ -81,9 +87,11 @@ export class RolloutCodexSource {
         if (ids.length > 1 || metadata.length > 1) {
           this.#options.diagnostics.add({ code: "duplicate_metadata_id", severity: "warning", message: "A rollout contains repeated or conflicting session metadata.", sourceKey });
         }
+        const registryFileId = stableRolloutFileIdentity(ids, decoded.identityPrefixHash);
+        registryFiles.set(path, { path, archived: root.archived, decoded, sessionIds: new Set(ids), registryFileId });
         for (const sessionId of ids) {
           const segments = this.#segments.get(sessionId) ?? [];
-          segments.push({ path, archived: root.archived, records: decoded.records, partial: decoded.partialTail, sessionId, segmentIdentity: stableSegmentIdentity(sessionId, decoded.identityPrefixHash) });
+          segments.push({ path, archived: root.archived, records: decoded.records, partial: decoded.partialTail, sessionId, segmentIdentity: stableSegmentIdentity(sessionId, decoded.identityPrefixHash), registryFileId });
           this.#segments.set(sessionId, segments);
         }
       }
@@ -95,6 +103,7 @@ export class RolloutCodexSource {
       if (segments.length > 1) this.#options.diagnostics.add({ code: "multi_segment_session", severity: "info", message: `One logical session aggregates ${segments.length} rollout segments.`, sessionId });
       threads.push(projectSegments(sessionId, segments));
     }
+    await this.#registry?.reconcile(await registryInputs(registryFiles, this.#segments));
     return { threads, projects: [] };
   }
 
@@ -105,7 +114,7 @@ export class RolloutCodexSource {
       for (const path of knownPaths) {
         try {
           const decoded = await decodeRollout(path, undefined, this.#options.diagnostics);
-          segments.push({ path, archived: path.toLocaleLowerCase("en-US").includes("archived_sessions"), records: decoded.records, partial: decoded.partialTail, sessionId, segmentIdentity: stableSegmentIdentity(sessionId, decoded.identityPrefixHash) });
+          segments.push({ path, archived: path.toLocaleLowerCase("en-US").includes("archived_sessions"), records: decoded.records, partial: decoded.partialTail, sessionId, segmentIdentity: stableSegmentIdentity(sessionId, decoded.identityPrefixHash), registryFileId: stableRolloutFileIdentity([sessionId], decoded.identityPrefixHash) });
         } catch {
           this.#options.diagnostics.add({ code: "corrupt_line", severity: "error", message: "A registered rollout could not be decoded.", sessionId, sourceKey: basename(path) });
         }
@@ -124,6 +133,36 @@ export class RolloutCodexSource {
     for (const [sessionId, segments] of this.#segments) projectRolloutTurns(sessionId, segments.slice().sort(compareSegments), this.#options.diagnostics, aliases);
     return aliases;
   }
+}
+
+async function registryInputs(
+  files: ReadonlyMap<string, { path: string; archived: boolean; decoded: DecodedRollout; sessionIds: Set<string>; registryFileId: string }>,
+  segmentsBySession: ReadonlyMap<string, readonly Segment[]>,
+): Promise<RolloutRegistryFileInput[]> {
+  const inputs: RolloutRegistryFileInput[] = [];
+  for (const file of files.values()) {
+    const segments: RolloutRegistryFileInput["sessions"] = [];
+    for (const [sessionId, sessionSegments] of segmentsBySession) {
+      const ordered = sessionSegments.slice().sort(compareSegments);
+      ordered.forEach((segment, segmentOrder) => {
+        if (segment.path === file.path) segments.push({ sessionId, stableSegmentIdentity: segment.segmentIdentity, segmentOrder });
+      });
+    }
+    const fileStat = await stat(file.path).catch(() => undefined);
+    const checkpoint = file.decoded.checkpoint;
+    inputs.push({
+      registryFileId: file.registryFileId,
+      canonicalPath: file.path,
+      rootKind: file.archived ? "archived" : "active",
+      stableFileIdentity: file.registryFileId,
+      size: checkpoint.observedEof,
+      mtimeMs: fileStat?.mtimeMs ?? 0,
+      sourceStamp: digest(["rollout-source-v1", String(checkpoint.observedEof), checkpoint.headHash, checkpoint.tailHash, checkpoint.identityPrefixHash ?? ""]),
+      checkpoint,
+      sessions: segments,
+    });
+  }
+  return inputs;
 }
 
 export async function decodeRollout(path: string, checkpoint: RolloutCheckpoint | undefined, diagnostics: DiagnosticCollector): Promise<DecodedRollout> {

@@ -17,6 +17,10 @@ export function stableSegmentIdentity(sessionId: string, identityPrefixHash: str
   return `segment:v2:${digest(["rollout-segment-v2", sessionId, identityPrefixHash]).slice(0, 24)}`;
 }
 
+export function stableRolloutFileIdentity(sessionIds: readonly string[], identityPrefixHash: string): string {
+  return `file:v1:${digest(["rollout-file-v1", ...[...sessionIds].sort(), identityPrefixHash]).slice(0, 24)}`;
+}
+
 export function recoveredTurnId(sessionId: string, segmentIdentity: string, boundaryRecordOrdinal: number): string {
   return `recovered:v2:${digest(["turn-v2", sessionId, segmentIdentity, String(boundaryRecordOrdinal)]).slice(0, 32)}`;
 }

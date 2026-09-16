@@ -4,5 +4,6 @@ export * from "./diagnostics.ts";
 export * from "./environment.ts";
 export * from "./path-canonicalizer.ts";
 export * from "./rollout-source.ts";
+export * from "./rollout-registry.ts";
 export * from "./turn-identity.ts";
 export * from "./update-monitor.ts";
