@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { NativeLineage, Page, Session, SessionProvider, SessionProviderCapabilities, Turn, WorkspaceScope } from "../../../packages/core/src/index.ts";
 import { semanticInputFingerprint, SqliteSemanticTraceStore } from "../../../packages/semantic-store/src/index.ts";
 import { WorkspaceSearchIndex } from "../src/search-index.ts";
@@ -96,14 +100,69 @@ test("scope-safe search API returns navigation payload without transcripts", asy
   assert.equal((await fetch(`${running.url}/api/scopes/workspace-a/search/status`)).status, 200);
 });
 
+test("persisted search stamps skip Turn reads after one-time legacy verification", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "codex-search-stamps-"));
+  const databasePath = join(directory, "search.sqlite");
+  const provider = new FixtureProvider();
+  provider.sourceStamps.set("session-a", "raw-a");
+  provider.sourceStamps.set("session-b", "raw-b");
+  const first = new WorkspaceSearchIndex({ databasePath, provider });
+  first.start("workspace-a"); await ready(first, "workspace-a");
+  await first.close();
+
+  const legacy = new DatabaseSync(databasePath);
+  legacy.exec("UPDATE search_session_state SET raw_source_stamp=NULL, semantic_source_stamp=NULL, verification_state='unverified'");
+  legacy.close();
+
+  provider.listTurnsCalls = 0;
+  const migrated = new WorkspaceSearchIndex({ databasePath, provider });
+  migrated.start("workspace-a"); await ready(migrated, "workspace-a");
+  assert.equal(provider.listTurnsCalls, 2, "the two Sessions in workspace-a are deep-verified once");
+  assert.equal(migrated.status("workspace-a").freshness, "verified");
+  assert.equal(migrated.query("workspace-a", "location-oracle").results[0]?.nativeTurnId, "native/a1");
+  await migrated.close();
+
+  provider.listTurnsCalls = 0;
+  const warm = new WorkspaceSearchIndex({ databasePath, provider });
+  warm.start("workspace-a"); await ready(warm, "workspace-a");
+  assert.equal(provider.listTurnsCalls, 0, "complete stamps avoid deep reads on subsequent startup");
+  assert.equal(warm.status("workspace-a").freshness, "verified");
+  await warm.close();
+  await rm(directory, { recursive: true, force: true });
+});
+
+test("verification failure keeps old documents queryable and marks the index unverified", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "codex-search-stale-"));
+  const databasePath = join(directory, "search.sqlite");
+  const provider = new FixtureProvider();
+  provider.sourceStamps.set("session-a", "raw-a");
+  provider.sourceStamps.set("session-b", "raw-b");
+  const first = new WorkspaceSearchIndex({ databasePath, provider });
+  first.start("workspace-a"); await ready(first, "workspace-a");
+  await first.close();
+
+  provider.sourceStamps.set("session-a", "raw-a-changed");
+  provider.failListTurns = true;
+  const stale = new WorkspaceSearchIndex({ databasePath, provider });
+  stale.start("workspace-a"); await ready(stale, "workspace-a");
+  assert.equal(stale.status("workspace-a").freshness, "unverified");
+  assert.equal(stale.query("workspace-a", "location-oracle").results[0]?.nativeTurnId, "native/a1");
+  await stale.close();
+  await rm(directory, { recursive: true, force: true });
+});
+
 class FixtureProvider implements SessionProvider {
   readonly sessions = sessions.map((value) => ({ ...value }));
   readonly turns = new Map([...turns].map(([sessionId, values]) => [sessionId, values.map((value) => ({ ...value }))]));
+  readonly sourceStamps = new Map<string, string>();
+  listTurnsCalls = 0;
+  failListTurns = false;
   async getCapabilities(): Promise<SessionProviderCapabilities> { return { nativeLineage: "none", openSession: false, openTurn: false, liveUpdates: false, titleRead: true, titleWrite: false, archiveRead: true }; }
   async listWorkspaceScopes(): Promise<readonly WorkspaceScope[]> { return scopes; }
   async listSessions(workspaceId: string): Promise<Page<Session>> { return { data: this.sessions.filter((item) => item.workspaceScopeId === workspaceId) }; }
   async readSession(sessionId: string): Promise<Session> { const value = this.sessions.find((item) => item.providerSessionId === sessionId); if (!value) throw new Error("missing"); return value; }
-  async listTurns(sessionId: string): Promise<Page<Turn>> { return { data: this.turns.get(sessionId) ?? [] }; }
+  async getSessionSourceStamp(sessionId: string): Promise<string | undefined> { return this.sourceStamps.get(sessionId); }
+  async listTurns(sessionId: string): Promise<Page<Turn>> { this.listTurnsCalls += 1; if (this.failListTurns) throw new Error("fixture verification failure"); return { data: this.turns.get(sessionId) ?? [] }; }
   async getNativeLineage(): Promise<NativeLineage | null> { return null; }
 }
 

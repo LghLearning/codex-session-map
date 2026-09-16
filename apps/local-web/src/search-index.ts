@@ -7,6 +7,8 @@ export type SearchSourceKind = "session_title" | "turn_label" | "turn_summary" |
 
 export interface SearchIndexStatus {
   readonly state: "idle" | "indexing" | "ready" | "error";
+  /** Persisted documents have been checked against current source metadata. */
+  readonly freshness?: "verified" | "unverified" | "stale";
   readonly totalSessions: number;
   readonly indexedSessions: number;
   readonly indexedTurns: number;
@@ -95,6 +97,7 @@ export class WorkspaceSearchIndex implements WorkspaceSearchPort {
       CREATE TABLE IF NOT EXISTS search_workspace_status (
         workspace_id TEXT PRIMARY KEY,
         state TEXT NOT NULL,
+        freshness TEXT NOT NULL DEFAULT 'unverified',
         total_sessions INTEGER NOT NULL DEFAULT 0,
         indexed_sessions INTEGER NOT NULL DEFAULT 0,
         indexed_turns INTEGER NOT NULL DEFAULT 0,
@@ -105,9 +108,16 @@ export class WorkspaceSearchIndex implements WorkspaceSearchPort {
         session_id TEXT PRIMARY KEY,
         workspace_id TEXT NOT NULL,
         source_fingerprint TEXT NOT NULL,
+        raw_source_stamp TEXT,
+        semantic_source_stamp TEXT,
+        verification_state TEXT NOT NULL DEFAULT 'unverified',
         indexed_turns INTEGER NOT NULL
       );
     `);
+    ensureColumn(this.#db, "search_workspace_status", "freshness", "TEXT NOT NULL DEFAULT 'unverified'");
+    ensureColumn(this.#db, "search_session_state", "raw_source_stamp", "TEXT");
+    ensureColumn(this.#db, "search_session_state", "semantic_source_stamp", "TEXT");
+    ensureColumn(this.#db, "search_session_state", "verification_state", "TEXT NOT NULL DEFAULT 'unverified'");
   }
 
   start(workspaceId: string): void {
@@ -118,7 +128,7 @@ export class WorkspaceSearchIndex implements WorkspaceSearchPort {
 
   status(workspaceId: string): SearchIndexStatus {
     const row = this.#db.prepare("SELECT * FROM search_workspace_status WHERE workspace_id=?").get(workspaceId) as StatusRow | undefined;
-    if (!row) return { state: "idle", totalSessions: 0, indexedSessions: 0, indexedTurns: 0, coverage: 0 };
+    if (!row) return { state: "idle", freshness: "unverified", totalSessions: 0, indexedSessions: 0, indexedTurns: 0, coverage: 0 };
     return projectStatus(row);
   }
 
@@ -146,7 +156,14 @@ export class WorkspaceSearchIndex implements WorkspaceSearchPort {
   }
 
   refreshSession(sessionId: string): void {
-    const task = this.#provider.readSession(sessionId).then((session) => this.#indexSession(session)).catch(() => this.removeSessionDocuments(sessionId)).finally(() => this.#refreshing.delete(task));
+    const task = this.#provider.readSession(sessionId)
+      .then((session) => this.#indexSession(session))
+      .catch(async (error) => {
+        const session = await this.#provider.readSession(sessionId).catch(() => undefined);
+        this.#markSessionUnverified(sessionId, error instanceof Error ? error.message : "Search verification failed.");
+        if (session) this.#markWorkspaceFreshness(session.workspaceScopeId, "stale", error instanceof Error ? error.message : "Search verification failed.");
+      })
+      .finally(() => this.#refreshing.delete(task));
     this.#refreshing.add(task);
   }
 
@@ -172,33 +189,47 @@ export class WorkspaceSearchIndex implements WorkspaceSearchPort {
   async #build(workspaceId: string): Promise<void> {
     this.#diagnostics.fullReconciliations += 1;
     const existing = this.status(workspaceId);
-    this.#writeStatus(workspaceId, { ...existing, state: "indexing", error: undefined });
+    this.#writeStatus(workspaceId, { ...existing, state: "indexing", freshness: existing.freshness ?? "unverified", error: undefined });
     try {
       const sessions = await listAllSessions(this.#provider, workspaceId);
-      this.#writeStatus(workspaceId, { state: "indexing", totalSessions: sessions.length, indexedSessions: 0, indexedTurns: 0, coverage: 0 });
+      this.#writeStatus(workspaceId, { state: "indexing", freshness: "unverified", totalSessions: sessions.length, indexedSessions: 0, indexedTurns: 0, coverage: 0 });
       let indexedSessions = 0, indexedTurns = 0;
+      let verificationFailures = 0;
+      let firstVerificationError: string | undefined;
       for (const session of sessions) {
-        indexedTurns += await this.#indexSession(session);
+        try { indexedTurns += await this.#indexSession(session); }
+        catch (error) {
+          verificationFailures += 1;
+          firstVerificationError ??= error instanceof Error ? error.message : "Search verification failed.";
+          this.#markSessionUnverified(session.providerSessionId, firstVerificationError);
+        }
         indexedSessions += 1;
-        this.#writeStatus(workspaceId, { state: "indexing", totalSessions: sessions.length, indexedSessions, indexedTurns, coverage: sessions.length ? indexedSessions / sessions.length : 1 });
+        this.#writeStatus(workspaceId, { state: "indexing", freshness: "unverified", totalSessions: sessions.length, indexedSessions, indexedTurns, coverage: sessions.length ? indexedSessions / sessions.length : 1, ...(firstVerificationError ? { error: firstVerificationError } : {}) });
         await new Promise<void>((resolve) => setImmediate(resolve));
       }
       const ids = new Set(sessions.map((session) => session.providerSessionId));
       const stale = this.#db.prepare("SELECT DISTINCT session_id FROM search_documents WHERE workspace_id=?").all(workspaceId) as unknown as { session_id: string }[];
       for (const row of stale) if (!ids.has(row.session_id)) this.#deleteSession(workspaceId, row.session_id);
-      this.#writeStatus(workspaceId, { state: "ready", totalSessions: sessions.length, indexedSessions, indexedTurns, coverage: 1 });
+      this.#writeStatus(workspaceId, { state: "ready", freshness: verificationFailures ? "unverified" : "verified", totalSessions: sessions.length, indexedSessions, indexedTurns, coverage: 1, ...(firstVerificationError ? { error: firstVerificationError } : {}) });
     } catch (error) {
       const current = this.status(workspaceId);
-      this.#writeStatus(workspaceId, { ...current, state: "error", error: error instanceof Error ? error.message : "Search indexing failed." });
+      this.#writeStatus(workspaceId, { ...current, state: "error", freshness: "stale", error: error instanceof Error ? error.message : "Search indexing failed." });
     }
   }
 
   async #indexSession(session: Session): Promise<number> {
+    const rawSourceStamp = await this.#provider.getSessionSourceStamp?.(session.providerSessionId);
+    const semantic = await this.#readSemantic(session);
+    const current = this.#db.prepare("SELECT source_fingerprint,indexed_turns,raw_source_stamp,semantic_source_stamp,verification_state,workspace_id FROM search_session_state WHERE session_id=?").get(session.providerSessionId) as SearchStateRow | undefined;
+    if (current && current.workspace_id === session.workspaceScopeId && current.verification_state === "verified" && rawSourceStamp && current.raw_source_stamp === rawSourceStamp && current.semantic_source_stamp === semantic.stamp) {
+      this.#diagnostics.skippedSessions += 1;
+      return current.indexed_turns;
+    }
     const turns = await listAllTurns(this.#provider, session.providerSessionId);
-    const semanticTitle = await this.#semantic?.getSessionTitle(session.providerId, session.providerSessionId);
+    const semanticTitle = semantic.title;
     const displayTitle = preferredSessionDisplayTitle(session.title, semanticTitle);
-    const traces = new Map((await this.#semantic?.listSession(session.providerId, session.providerSessionId) ?? []).map((trace) => [trace.nativeTurnId, trace]));
-    const labels = new Map((this.#semantic?.overrides.list(session.providerId, "label", session.providerSessionId) ?? []).flatMap((item) => item.nativeTurnId && item.value?.label ? [[item.nativeTurnId, item.value.label] as const] : []));
+    const traces = semantic.traces;
+    const labels = semantic.labels;
     const documents: SearchDocument[] = [{
       docId: documentId(session.providerSessionId, undefined, "session_title"), workspaceId: session.workspaceScopeId,
       sessionId: session.providerSessionId, sessionTitle: displayTitle, sourceKind: "session_title", timestamp: session.updatedAt,
@@ -210,21 +241,47 @@ export class WorkspaceSearchIndex implements WorkspaceSearchPort {
       if (userLabel) documents.push({ ...common, docId: documentId(session.providerSessionId, turn.nativeTurnId, "turn_label"), sourceKind: "turn_label", text: userLabel });
       const trace = traces.get(turn.nativeTurnId);
       if (trace?.inputFingerprint === semanticInputFingerprint(turn)) {
-        const feedback = await this.#semantic?.getUserFeedback(trace);
+        const feedback = semantic.feedback?.get(trace.nativeTurnId);
         if (feedback?.verdict !== "rejected") documents.push({ ...common, docId: documentId(session.providerSessionId, turn.nativeTurnId, "turn_summary"), sourceKind: "turn_summary", text: feedback?.editedText ?? trace.text });
       }
       if (turn.input.text) documents.push({ ...common, docId: documentId(session.providerSessionId, turn.nativeTurnId, "user_input"), sourceKind: "user_input", text: turn.input.text });
       if (turn.assistantFinal) documents.push({ ...common, docId: documentId(session.providerSessionId, turn.nativeTurnId, "assistant_final"), sourceKind: "assistant_final", text: turn.assistantFinal });
     }
     const sourceFingerprint = fingerprint(documents.map((document) => `${document.docId}\0${normalizeText(document.text)}`).join("\n"));
-    const current = this.#db.prepare("SELECT source_fingerprint,indexed_turns FROM search_session_state WHERE session_id=?").get(session.providerSessionId) as { source_fingerprint: string; indexed_turns: number } | undefined;
-    if (current?.source_fingerprint === sourceFingerprint) { this.#diagnostics.skippedSessions += 1; return current.indexed_turns; }
+    if (current?.source_fingerprint === sourceFingerprint && current.raw_source_stamp === (rawSourceStamp ?? null) && current.semantic_source_stamp === semantic.stamp && current.verification_state === "verified") { this.#diagnostics.skippedSessions += 1; return current.indexed_turns; }
     this.#replaceSession(session.workspaceScopeId, session.providerSessionId, documents);
     this.#diagnostics.refreshedSessions += 1;
-    this.#db.prepare(`INSERT INTO search_session_state(session_id,workspace_id,source_fingerprint,indexed_turns) VALUES(?,?,?,?)
-      ON CONFLICT(session_id) DO UPDATE SET workspace_id=excluded.workspace_id,source_fingerprint=excluded.source_fingerprint,indexed_turns=excluded.indexed_turns`)
-      .run(session.providerSessionId, session.workspaceScopeId, sourceFingerprint, turns.length);
+    this.#db.prepare(`INSERT INTO search_session_state(session_id,workspace_id,source_fingerprint,raw_source_stamp,semantic_source_stamp,verification_state,indexed_turns) VALUES(?,?,?,?,?,?,?)
+      ON CONFLICT(session_id) DO UPDATE SET workspace_id=excluded.workspace_id,source_fingerprint=excluded.source_fingerprint,raw_source_stamp=excluded.raw_source_stamp,semantic_source_stamp=excluded.semantic_source_stamp,verification_state=excluded.verification_state,indexed_turns=excluded.indexed_turns`)
+      .run(session.providerSessionId, session.workspaceScopeId, sourceFingerprint, rawSourceStamp ?? null, semantic.stamp, "verified", turns.length);
     return turns.length;
+  }
+
+  async #readSemantic(session: Session): Promise<SemanticSnapshot> {
+    if (!this.#semantic) return { title: undefined, traces: new Map(), labels: new Map(), stamp: fingerprint("semantic:none") };
+    const title = await this.#semantic.getSessionTitle(session.providerId, session.providerSessionId);
+    const traceRows = await this.#semantic.listSession(session.providerId, session.providerSessionId);
+    const traces = new Map(traceRows.map((trace) => [trace.nativeTurnId, trace]));
+    const feedback = new Map<string, Awaited<ReturnType<SearchSemanticSource["getUserFeedback"]>>>();
+    for (const trace of traceRows) feedback.set(trace.nativeTurnId, await this.#semantic.getUserFeedback(trace));
+    const labels = new Map((this.#semantic.overrides.list(session.providerId, "label", session.providerSessionId) ?? [])
+      .flatMap((item) => item.nativeTurnId && item.value?.label ? [[item.nativeTurnId, item.value.label] as const] : []));
+    const stamp = fingerprint(JSON.stringify({
+      title: title ?? null,
+      traces: traceRows.map((trace) => ({ id: trace.nativeTurnId, text: trace.text, input: trace.inputFingerprint, generator: trace.generator, feedback: feedback.get(trace.nativeTurnId) ?? null })),
+      labels: [...labels.entries()],
+    }));
+    return { title, traces, labels, feedback, stamp };
+  }
+
+  #markSessionUnverified(sessionId: string, error?: string): void {
+    this.#db.prepare("UPDATE search_session_state SET raw_source_stamp=NULL, semantic_source_stamp=NULL, verification_state='unverified' WHERE session_id=?").run(sessionId);
+    void error;
+  }
+
+  #markWorkspaceFreshness(workspaceId: string, freshness: SearchIndexStatus["freshness"], error?: string): void {
+    const current = this.status(workspaceId);
+    this.#writeStatus(workspaceId, { ...current, state: current.state === "idle" ? "ready" : current.state, freshness, ...(error ? { error } : {}) });
   }
 
   #replaceSession(workspaceId: string, sessionId: string, documents: readonly SearchDocument[]): void {
@@ -276,19 +333,27 @@ export class WorkspaceSearchIndex implements WorkspaceSearchPort {
   }
 
   #writeStatus(workspaceId: string, status: SearchIndexStatus): void {
-    this.#db.prepare(`INSERT INTO search_workspace_status(workspace_id,state,total_sessions,indexed_sessions,indexed_turns,updated_at,error)
-      VALUES (?,?,?,?,?,?,?) ON CONFLICT(workspace_id) DO UPDATE SET state=excluded.state,total_sessions=excluded.total_sessions,
+    this.#db.prepare(`INSERT INTO search_workspace_status(workspace_id,state,freshness,total_sessions,indexed_sessions,indexed_turns,updated_at,error)
+      VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(workspace_id) DO UPDATE SET state=excluded.state,freshness=excluded.freshness,total_sessions=excluded.total_sessions,
       indexed_sessions=excluded.indexed_sessions,indexed_turns=excluded.indexed_turns,updated_at=excluded.updated_at,error=excluded.error`)
-      .run(workspaceId, status.state, status.totalSessions, status.indexedSessions, status.indexedTurns, new Date().toISOString(), status.error ?? null);
+      .run(workspaceId, status.state, status.freshness ?? "unverified", status.totalSessions, status.indexedSessions, status.indexedTurns, new Date().toISOString(), status.error ?? null);
   }
 }
 
 interface SearchDocument { docId: string; workspaceId: string; sessionId: string; nativeTurnId?: string; displayOrdinal?: number; sessionTitle: string; sourceKind: SearchSourceKind; timestamp?: string; text: string }
 interface SearchRow { session_id: string; native_turn_id: string | null; display_ordinal: number | null; session_title: string; source_kind: SearchSourceKind; source_timestamp: string | null; normalized_text: string; snippet: string }
-interface StatusRow { state: SearchIndexStatus["state"]; total_sessions: number; indexed_sessions: number; indexed_turns: number; updated_at: string | null; error: string | null }
+interface SearchStateRow { source_fingerprint: string; indexed_turns: number; raw_source_stamp: string | null; semantic_source_stamp: string | null; verification_state: "verified" | "unverified" | "stale"; workspace_id: string }
+interface StatusRow { state: SearchIndexStatus["state"]; freshness: SearchIndexStatus["freshness"]; total_sessions: number; indexed_sessions: number; indexed_turns: number; updated_at: string | null; error: string | null }
+interface SemanticSnapshot {
+  readonly title?: Awaited<ReturnType<SqliteSemanticTraceStore["getSessionTitle"]>>;
+  readonly traces: ReadonlyMap<string, Awaited<ReturnType<SqliteSemanticTraceStore["listSession"]>>[number]>;
+  readonly labels: ReadonlyMap<string, string>;
+  readonly feedback?: ReadonlyMap<string, Awaited<ReturnType<SearchSemanticSource["getUserFeedback"]>>>;
+  readonly stamp: string;
+}
 
 function projectStatus(row: StatusRow): SearchIndexStatus {
-  return { state: row.state, totalSessions: row.total_sessions, indexedSessions: row.indexed_sessions, indexedTurns: row.indexed_turns, coverage: row.total_sessions ? row.indexed_sessions / row.total_sessions : row.state === "ready" ? 1 : 0, updatedAt: row.updated_at ?? undefined, error: row.error ?? undefined };
+  return { state: row.state, freshness: row.freshness ?? "unverified", totalSessions: row.total_sessions, indexedSessions: row.indexed_sessions, indexedTurns: row.indexed_turns, coverage: row.total_sessions ? row.indexed_sessions / row.total_sessions : row.state === "ready" ? 1 : 0, updatedAt: row.updated_at ?? undefined, error: row.error ?? undefined };
 }
 function projectResult(row: SearchRow, value: { text: string; highlights: { start: number; end: number }[] }): WorkspaceSearchResult {
   return { sessionId: row.session_id, nativeTurnId: row.native_turn_id ?? undefined, displayOrdinal: row.display_ordinal ?? undefined, sessionTitle: row.session_title, timestamp: row.source_timestamp ?? undefined, sourceKind: row.source_kind, snippet: value.text, highlights: value.highlights };
@@ -317,6 +382,11 @@ function documentId(sessionId: string, turnId: string | undefined, kind: SearchS
 function encodeCursor(offset: number): string { return Buffer.from(String(offset), "utf8").toString("base64url"); }
 function decodeCursor(value?: string): number { if (!value) return 0; const offset = Number(Buffer.from(value, "base64url").toString("utf8")); return Number.isSafeInteger(offset) && offset >= 0 ? offset : 0; }
 function isSourceKind(value: string): value is SearchSourceKind { return ["session_title", "turn_label", "turn_summary", "user_input", "assistant_final"].includes(value); }
+
+function ensureColumn(db: DatabaseSync, table: string, column: string, definition: string): void {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as unknown as { name: string }[];
+  if (!columns.some((item) => item.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
 
 async function listAllSessions(provider: SessionProvider, workspaceId: string): Promise<Session[]> {
   const values: Session[] = []; let cursor: string | undefined; const seen = new Set<string>();

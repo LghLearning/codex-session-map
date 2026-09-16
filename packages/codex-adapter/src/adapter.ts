@@ -101,6 +101,11 @@ export class CodexAdapterV1 implements SessionProvider, LiveSessionProvider {
     return session;
   }
 
+  async getSessionSourceStamp(sessionId: string): Promise<string | undefined> {
+    await this.#ensureLoaded();
+    return this.#rollout?.sessionSourceStamp(sessionId);
+  }
+
   async listTurns(sessionId: string, cursor?: string): Promise<Page<Turn>> {
     return page(await this.#readTurns(sessionId), cursor, this.#options.pageSize ?? 100);
   }

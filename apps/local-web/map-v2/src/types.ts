@@ -30,7 +30,7 @@ export interface TurnDirectoryItem {
 }
 
 export type SearchSourceKind = "session_title" | "turn_label" | "turn_summary" | "user_input" | "assistant_final";
-export interface SearchIndexStatus { state: "idle" | "indexing" | "ready" | "error"; totalSessions: number; indexedSessions: number; indexedTurns: number; coverage: number; error?: string }
+export interface SearchIndexStatus { state: "idle" | "indexing" | "ready" | "error"; freshness?: "verified" | "unverified" | "stale"; totalSessions: number; indexedSessions: number; indexedTurns: number; coverage: number; error?: string }
 export interface SearchResult { sessionId: string; nativeTurnId?: string; displayOrdinal?: number; sessionTitle: string; timestamp?: string; sourceKind: SearchSourceKind; snippet: string; highlights: { start: number; end: number }[] }
 export interface SearchPage { query: string; results: SearchResult[]; nextCursor?: string; mode: "fts5_trigram" | "substring_fallback"; index: SearchIndexStatus }
 

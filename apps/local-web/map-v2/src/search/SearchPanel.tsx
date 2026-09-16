@@ -32,7 +32,7 @@ export function SearchPanel(props: {
 }
 
 function IndexState({ index }: { index: SearchIndexStatus }) {
-  if (index.state === "ready") return <small>{index.indexedTurns} Turns indexed</small>;
+  if (index.state === "ready") return <small>{index.indexedTurns} Turns indexed{index.freshness && index.freshness !== "verified" ? " · verification pending" : ""}</small>;
   if (index.state === "error") return <small className="search-error">Index unavailable</small>;
   return <small>Indexing · {Math.round(index.coverage * 100)}% ready</small>;
 }

@@ -127,6 +127,7 @@ interface SegmentDescriptor {
   readonly segmentIdentity: string;
   readonly registryFileId: string;
   readonly checkpoint: RolloutCheckpoint;
+  readonly contentStamp: string;
   readonly summary: SessionSummary;
 }
 
@@ -293,6 +294,26 @@ export class RolloutCodexSource {
     const ids = new Set<string>();
     for (const descriptor of descriptors) for (const id of descriptor.summary.turnIds) ids.add(id);
     return ids.size || descriptors.reduce((count, descriptor) => count + descriptor.summary.turnCount, 0);
+  }
+
+  /** Cheap rebuildable freshness stamp derived from registered segment metadata. */
+  sessionSourceStamp(sessionId: string): string | undefined {
+    const descriptors = this.#descriptors.get(sessionId);
+    if (!descriptors?.length) return undefined;
+    return digest([
+      "session-source-v1",
+        ...descriptors.slice().sort(compareDescriptors).map((descriptor) => [
+        descriptor.segmentIdentity,
+        descriptor.registryFileId,
+        descriptor.contentStamp,
+        descriptor.checkpoint.observedEof,
+        descriptor.checkpoint.committedOffset,
+        descriptor.checkpoint.headHash,
+        descriptor.checkpoint.tailHash,
+        descriptor.summary.turnCount,
+        descriptor.summary.turnIds.join(","),
+      ].join("\0")),
+    ]);
   }
 
   async listTurnIdentityAliases(): Promise<readonly TurnIdentityAlias[]> {
@@ -479,7 +500,7 @@ function buildDescriptors(files: ReadonlyMap<string, FileState>): Map<string, Se
   const descriptors = new Map<string, SegmentDescriptor[]>();
   for (const file of files.values()) for (const summary of file.summaries) {
     const values = descriptors.get(summary.id) ?? [];
-    values.push({ path: file.path, archived: file.archived, partial: file.checkpoint.committedOffset !== file.checkpoint.observedEof, sessionId: summary.id, segmentIdentity: stableSegmentIdentity(summary.id, file.checkpoint.identityPrefixHash ?? ""), registryFileId: file.registryFileId, checkpoint: file.checkpoint, summary });
+      values.push({ path: file.path, archived: file.archived, partial: file.checkpoint.committedOffset !== file.checkpoint.observedEof, sessionId: summary.id, segmentIdentity: stableSegmentIdentity(summary.id, file.checkpoint.identityPrefixHash ?? ""), registryFileId: file.registryFileId, checkpoint: file.checkpoint, contentStamp: file.contentStamp, summary });
     descriptors.set(summary.id, values);
   }
   return descriptors;
