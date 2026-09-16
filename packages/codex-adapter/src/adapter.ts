@@ -16,7 +16,7 @@ import { DiagnosticCollector, type CodexDiagnostic } from "./diagnostics.ts";
 import { detectCodexEnvironment, type CodexEnvironment } from "./environment.ts";
 import type { CodexProjectRecord, CodexThreadRecord, CodexTurnRecord, SourceSnapshot } from "./internal.ts";
 import { canonicalizeWorkspacePath } from "./path-canonicalizer.ts";
-import { RolloutCodexSource } from "./rollout-source.ts";
+import { RolloutCodexSource, type DecodedRollout, type RolloutCheckpoint } from "./rollout-source.ts";
 import type { TurnIdentityAlias } from "./turn-identity.ts";
 import { StructuredCodexSource } from "./sqlite-source.ts";
 import { CodexUpdateMonitor, type SourceInvalidationReason } from "./update-monitor.ts";
@@ -35,6 +35,8 @@ export interface CodexAdapterOptions {
   readonly disableFilesystemWatch?: boolean;
   /** App-owned rebuildable rollout source registry. Disabled when omitted. */
   readonly sourceRegistryPath?: string;
+  /** Narrow deterministic test seam; production keeps the default rollout decoder. */
+  readonly decodeRollout?: (path: string, checkpoint: RolloutCheckpoint | undefined, diagnostics: DiagnosticCollector) => Promise<DecodedRollout>;
 }
 
 interface MaterializedState {
@@ -101,6 +103,18 @@ export class CodexAdapterV1 implements SessionProvider, LiveSessionProvider {
 
   async listTurns(sessionId: string, cursor?: string): Promise<Page<Turn>> {
     return page(await this.#readTurns(sessionId), cursor, this.#options.pageSize ?? 100);
+  }
+
+  async countTurns(sessionId: string): Promise<number> {
+    await this.#ensureLoaded();
+    if (this.#rollout) {
+      const record = this.#state!.records.get(sessionId);
+      if (record?.sourceTier === "reconciliation" || record?.rolloutPaths.length) {
+        const count = this.#rollout.countTurns(sessionId);
+        if (count > 0) return count;
+      }
+    }
+    return (await this.#readTurns(sessionId)).length;
   }
 
   async readTurn(sessionId: string, nativeTurnId: string): Promise<Turn | undefined> {
@@ -224,7 +238,7 @@ export class CodexAdapterV1 implements SessionProvider, LiveSessionProvider {
   async #load(): Promise<void> {
     const environment = await this.getEnvironment();
     this.#structured = new StructuredCodexSource({ codexHome: environment.codexHome, diagnostics: this.#diagnostics, stateDatabase: environment.stateDatabase, historyDatabase: environment.historyDatabase });
-    this.#rollout = new RolloutCodexSource({ codexHome: environment.codexHome, diagnostics: this.#diagnostics, registryPath: this.#options.sourceRegistryPath });
+    this.#rollout = new RolloutCodexSource({ codexHome: environment.codexHome, diagnostics: this.#diagnostics, registryPath: this.#options.sourceRegistryPath, decodeRollout: this.#options.decodeRollout });
 
     let primary: SourceSnapshot = { threads: [], projects: [] };
     if (!this.#options.disableAppServer && environment.appServerExecutable) {
@@ -256,6 +270,8 @@ export class CodexAdapterV1 implements SessionProvider, LiveSessionProvider {
       if (!this.#rollout || !this.#structured) return;
       const result = await this.#rollout.refresh(paths);
       this.#rolloutSnapshot = result.snapshot;
+      const hasNonRolloutHint = paths?.some((path) => !isRolloutPath(path, environment.codexHome)) ?? false;
+      if (paths && !hasNonRolloutHint && !result.changed) return;
       if (paths?.length && paths.some((path) => !isRolloutPath(path, environment.codexHome))) {
         this.#structuredSnapshot = await this.#structured.list();
         if (this.#appServer) {
@@ -304,7 +320,8 @@ function changedSessions(before: MaterializedState, after: MaterializedState): {
 }
 
 function sourceStateFingerprint(session: Session, record?: CodexThreadRecord): string {
-  return createHash("sha256").update(JSON.stringify({ session, record })).digest("hex");
+  const { health: _health, ...stableSession } = session;
+  return createHash("sha256").update(JSON.stringify({ session: stableSession, record })).digest("hex");
 }
 
 function isRolloutPath(path: string, codexHome: string): boolean {

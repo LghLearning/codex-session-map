@@ -357,16 +357,7 @@ async function createForestProjection(values: readonly string[]): Promise<{ fore
       }));
     };
     const countTurns = async (sessionId: string): Promise<number> => {
-      let count = 0, cursor: string | undefined;
-      const seen = new Set<string>();
-      do {
-        const page = await adapter.listTurns(sessionId, cursor);
-        count += page.data.length;
-        if (!page.nextCursor || seen.has(page.nextCursor)) break;
-        seen.add(page.nextCursor);
-        cursor = page.nextCursor;
-      } while (cursor);
-      return count;
+      return adapter.countTurns(sessionId);
     };
     return {
       forest: {

@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
 import { open, readdir, stat } from "node:fs/promises";
+import { StringDecoder } from "node:string_decoder";
 import { basename, join } from "node:path";
 import type { DiagnosticCollector } from "./diagnostics.ts";
 import type { CodexThreadRecord, CodexToolRecord, CodexTurnRecord, SourceSnapshot } from "./internal.ts";
 import { compactText, isRecord, stringValue } from "./internal.ts";
 import { digest, legacyRecoveredTurnId, recoveredTurnId, stableRolloutFileIdentity, stableSegmentIdentity, type TurnIdentityAlias } from "./turn-identity.ts";
-import { RolloutSourceRegistry, type RolloutRegistryFileInput } from "./rollout-registry.ts";
+import { RolloutSourceRegistry, type RolloutRegistryFileInput, type RolloutRegistryFileState, type RolloutRegistrySessionSummary } from "./rollout-registry.ts";
 
 const DECODER_VERSION = 2;
 const PROBE_BYTES = 4 * 1024;
@@ -59,6 +60,8 @@ export interface RolloutSourceOptions {
   readonly codexHome: string;
   readonly diagnostics: DiagnosticCollector;
   readonly registryPath?: string;
+  /** Narrow deterministic test seam; production uses decodeRollout. */
+  readonly decodeRollout?: (path: string, checkpoint: RolloutCheckpoint | undefined, diagnostics: DiagnosticCollector) => Promise<DecodedRollout>;
 }
 
 interface Segment {
@@ -71,21 +74,78 @@ interface Segment {
   readonly registryFileId: string;
 }
 
+interface SessionSummary {
+  readonly id: string;
+  readonly title?: string;
+  readonly preview?: string;
+  readonly cwds: readonly string[];
+  readonly projectId?: string;
+  readonly createdAtMs?: number;
+  readonly updatedAtMs?: number;
+  readonly archived: boolean;
+  readonly source?: string;
+  readonly historyMode?: string;
+  readonly parentSessionId?: string;
+  readonly originTurnId?: string;
+  readonly turnCount: number;
+  readonly turnIds: readonly string[];
+  readonly legacyBoundaryOrdinals: readonly number[];
+}
+
+interface SummaryAccumulator {
+  readonly archived: boolean;
+  readonly sessions: Map<string, {
+    id: string;
+    title?: string;
+    preview?: string;
+    cwds: Set<string>;
+    projectId?: string;
+    createdAtMs?: number;
+    updatedAtMs?: number;
+    archived: boolean;
+    source?: string;
+    historyMode?: string;
+    parentSessionId?: string;
+    originTurnId?: string;
+    turnKeys: Set<string>;
+    legacyBoundaries: Set<number>;
+    currentId?: string;
+    currentIsNative: boolean;
+    currentHasInput: boolean;
+  }>;
+  currentSessionId?: string;
+  firstCommittedRecordHash?: string;
+  firstMetaHash?: string;
+  firstBoundaryHash?: string;
+}
+
+interface SegmentDescriptor {
+  readonly path: string;
+  readonly archived: boolean;
+  readonly partial: boolean;
+  readonly sessionId: string;
+  readonly segmentIdentity: string;
+  readonly registryFileId: string;
+  readonly checkpoint: RolloutCheckpoint;
+  readonly summary: SessionSummary;
+}
+
 interface FileState {
   readonly path: string;
   readonly archived: boolean;
-  readonly decoded: DecodedRollout;
+  readonly checkpoint: RolloutCheckpoint;
   readonly sessionIds: ReadonlySet<string>;
   readonly registryFileId: string;
   readonly size: number;
   readonly mtimeMs: number;
   readonly sourceStamp: string;
   readonly contentStamp: string;
+  readonly summaries: readonly SessionSummary[];
 }
 
 export class RolloutCodexSource {
   readonly #options: RolloutSourceOptions;
-  readonly #segments = new Map<string, Segment[]>();
+  readonly #descriptors = new Map<string, SegmentDescriptor[]>();
   readonly #registry?: RolloutSourceRegistry;
   #files = new Map<string, FileState>();
   #snapshot?: SourceSnapshot;
@@ -99,7 +159,7 @@ export class RolloutCodexSource {
     return (await this.refresh()).snapshot;
   }
 
-  /** Reconciles rollout files while reusing unchanged decoded files in memory. */
+  /** Reconciles rollout metadata without retaining decoded rollout records. */
   async refresh(changedPaths?: readonly string[]): Promise<RolloutRefreshResult> {
     const started = Date.now();
     const initial = !this.#snapshot;
@@ -112,6 +172,7 @@ export class RolloutCodexSource {
     const hinted = new Set((changedPaths ?? []).map(pathKey));
     const inspectAll = initial;
     const files = new Map(this.#files);
+    const persisted = initial ? new Map((this.#registry?.snapshot() ?? []).map((file) => [pathKey(file.canonicalPath), file])) : new Map<string, RolloutRegistryFileState>();
     const affectedPaths = new Set<string>();
     const affectedSessions = new Set<string>();
     let filesDecodedFull = 0;
@@ -127,16 +188,26 @@ export class RolloutCodexSource {
       // A concrete watcher hint is authoritative enough to decode the file even
       // when its size and timestamp have not changed (some filesystems have
       // coarse timestamp resolution). Periodic scans may use the cheap probe.
-      if (previous && changedPaths === undefined && observed.size === previous.size && observed.mtimeMs === previous.mtimeMs && await probeUnchanged(entry.path, previous.decoded.checkpoint)) continue;
+      if (previous && changedPaths === undefined && observed.size === previous.size && observed.mtimeMs === previous.mtimeMs && await probeUnchanged(entry.path, previous.checkpoint)) continue;
       try {
-        const decoded = await decodeRollout(entry.path, previous?.decoded.checkpoint, this.#options.diagnostics);
-        bytesRead += decoded.bytesRead;
-        if (decoded.mode === "append" && previous) filesDecodedAppend += 1;
+        const cached = !previous && persisted.get(key);
+        if (cached && cached.size === observed.size && cached.mtimeMs === observed.mtimeMs && cached.checkpoint.decoderVersion === DECODER_VERSION && cached.contentStamp && cached.sessions.length > 0 && cached.sessions.every((session) => Boolean(session.summary)) && await probeUnchanged(entry.path, cached.checkpoint)) {
+          const summaries = cached.sessions.map((session) => registrySummary(session.summary!, session.sessionId, entry.archived));
+          files.set(key, { path: entry.path, archived: entry.archived, checkpoint: cached.checkpoint, sessionIds: new Set(summaries.map((summary) => summary.id)), registryFileId: cached.registryFileId, size: observed.size, mtimeMs: observed.mtimeMs, sourceStamp: cached.sourceStamp, contentStamp: cached.contentStamp, summaries });
+          continue;
+        }
+        const decoder = this.#options.decodeRollout ?? decodeRollout;
+        const appendCandidate = previous && await canAppend(entry.path, previous.checkpoint);
+        const decoded = appendCandidate ? await decoder(entry.path, previous?.checkpoint, this.#options.diagnostics) : undefined;
+        const scanned = decoded?.mode === "append" && previous
+          ? appendMetadata(previous, decoded, entry.archived)
+          : decoded
+            ? metadataFromRecords(decoded.records, decoded.checkpoint, decoded.identityPrefixHash, decoded.partialTail, entry.archived, decoded.bytesRead)
+            : await scanRolloutMetadata(entry.path, entry.archived, this.#options.diagnostics);
+        bytesRead += scanned.bytesRead;
+        if (decoded?.mode === "append" && previous) filesDecodedAppend += 1;
         else filesDecodedFull += 1;
-        const combined = decoded.mode === "append" && previous
-          ? { ...decoded, records: [...previous.decoded.records, ...decoded.records], mode: "append" as const, partialTail: decoded.partialTail }
-          : decoded;
-        const ids = extractSessionIds(combined.records);
+        const ids = scanned.summaries.map((summary) => summary.id);
         if (!ids.length) {
           this.#options.diagnostics.add({ code: "orphan_rollout", severity: "warning", message: "A rollout has no usable session metadata id.", sourceKey: basename(entry.path) });
           files.delete(key);
@@ -145,11 +216,11 @@ export class RolloutCodexSource {
           continue;
         }
         if (ids.length > 1) this.#options.diagnostics.add({ code: "duplicate_metadata_id", severity: "warning", message: "A rollout contains repeated or conflicting session metadata.", sourceKey: basename(entry.path) });
-        const registryFileId = stableRolloutFileIdentity(ids, combined.identityPrefixHash);
-        const sourceStamp = digest(["rollout-source-v1", String(combined.checkpoint.observedEof), combined.checkpoint.headHash, combined.checkpoint.tailHash, combined.checkpoint.identityPrefixHash ?? ""]);
-        const contentStamp = decodedContentStamp(combined);
+        const registryFileId = stableRolloutFileIdentity(ids, scanned.identityPrefixHash);
+        const sourceStamp = digest(["rollout-source-v1", String(scanned.checkpoint.observedEof), scanned.checkpoint.headHash, scanned.checkpoint.tailHash, scanned.checkpoint.identityPrefixHash ?? ""]);
+        const contentStamp = scanned.contentStamp;
         const contentChanged = !previous || previous.contentStamp !== contentStamp || previous.archived !== entry.archived;
-        files.set(key, { path: entry.path, archived: entry.archived, decoded: combined, sessionIds: new Set(ids), registryFileId, size: observed.size, mtimeMs: observed.mtimeMs, sourceStamp, contentStamp });
+        files.set(key, { path: entry.path, archived: entry.archived, checkpoint: scanned.checkpoint, sessionIds: new Set(ids), registryFileId, size: observed.size, mtimeMs: observed.mtimeMs, sourceStamp, contentStamp, summaries: scanned.summaries });
         if (contentChanged) {
           affectedPaths.add(entry.path);
           for (const sessionId of ids) affectedSessions.add(sessionId);
@@ -165,22 +236,22 @@ export class RolloutCodexSource {
       affectedPaths.add(previous.path);
       for (const sessionId of previous.sessionIds) affectedSessions.add(sessionId);
     }
-    const segments = buildSegments(files);
+    const descriptors = buildDescriptors(files);
     const threads: CodexThreadRecord[] = [];
-    for (const [sessionId, sessionSegments] of segments) {
-      const ordered = sessionSegments.slice().sort(compareSegments);
+    for (const [sessionId, sessionDescriptors] of descriptors) {
+      const ordered = sessionDescriptors.slice().sort(compareDescriptors);
       if (ordered.length > 1) this.#options.diagnostics.add({ code: "multi_segment_session", severity: "info", message: `One logical session aggregates ${ordered.length} rollout segments.`, sessionId });
-      threads.push(projectSegments(sessionId, ordered));
+      threads.push(projectSummary(sessionId, ordered));
     }
     const snapshot: SourceSnapshot = { threads, projects: [] };
     const previousIds = new Set(this.#snapshot?.threads.map((thread) => thread.id) ?? []);
     const nextIds = new Set(threads.map((thread) => thread.id));
     const deletedSessionIds = [...previousIds].filter((id) => !nextIds.has(id));
     const changed = initial || deletedSessionIds.length > 0 || affectedPaths.size > 0;
-    if (changed) await this.#registry?.reconcile(await registryInputs(files, segments));
+    if (changed) await this.#registry?.reconcile(await registryInputs(files, descriptors));
     this.#files = files;
-    this.#segments.clear();
-    for (const [sessionId, sessionSegments] of segments) this.#segments.set(sessionId, sessionSegments);
+    this.#descriptors.clear();
+    for (const [sessionId, sessionDescriptors] of descriptors) this.#descriptors.set(sessionId, sessionDescriptors);
     this.#snapshot = snapshot;
     return {
       snapshot,
@@ -192,60 +263,242 @@ export class RolloutCodexSource {
   }
 
   async listTurns(sessionId: string, knownPaths: readonly string[] = []): Promise<readonly CodexTurnRecord[]> {
-    let segments = this.#segments.get(sessionId);
-    if (!segments && knownPaths.length) {
-      segments = [];
-      for (const path of knownPaths) {
-        try {
-          const decoded = await decodeRollout(path, undefined, this.#options.diagnostics);
-          segments.push({ path, archived: path.toLocaleLowerCase("en-US").includes("archived_sessions"), records: decoded.records, partial: decoded.partialTail, sessionId, segmentIdentity: stableSegmentIdentity(sessionId, decoded.identityPrefixHash), registryFileId: stableRolloutFileIdentity([sessionId], decoded.identityPrefixHash) });
-        } catch {
-          this.#options.diagnostics.add({ code: "corrupt_line", severity: "error", message: "A registered rollout could not be decoded.", sessionId, sourceKey: basename(path) });
-        }
-      }
-    }
-    if (!segments?.length) return [];
+    const segments = await this.#readSegments(sessionId, knownPaths);
+    if (!segments.length) return [];
     return projectRolloutTurns(sessionId, segments.slice().sort(compareSegments), this.#options.diagnostics);
   }
 
-  segmentCount(sessionId: string): number {
-    return this.#segments.get(sessionId)?.length ?? 0;
+  async #readSegments(sessionId: string, knownPaths: readonly string[] = []): Promise<Segment[]> {
+    const descriptors = this.#descriptors.get(sessionId) ?? (knownPaths.length ? knownPaths.map((path) => ({ path, archived: path.toLocaleLowerCase("en-US").includes("archived_sessions"), partial: false, sessionId, segmentIdentity: stableSegmentIdentity(sessionId, "unknown"), registryFileId: stableRolloutFileIdentity([sessionId], "unknown"), checkpoint: emptyCheckpoint(), summary: { id: sessionId, cwds: [], archived: false, turnCount: 0, turnIds: [], legacyBoundaryOrdinals: [] } })) : []);
+    const segments: Segment[] = [];
+    for (const descriptor of descriptors) {
+      try {
+        const observed = await stat(descriptor.path).catch(() => undefined);
+        const readLimit = observed && observed.size > descriptor.checkpoint.observedEof ? descriptor.checkpoint.observedEof : undefined;
+        const decoded = await decodeRollout(descriptor.path, undefined, this.#options.diagnostics, readLimit);
+        segments.push({ path: descriptor.path, archived: descriptor.archived, records: decoded.records, partial: decoded.partialTail, sessionId, segmentIdentity: descriptor.segmentIdentity, registryFileId: descriptor.registryFileId });
+      } catch {
+        this.#options.diagnostics.add({ code: "corrupt_line", severity: "error", message: "A registered rollout could not be decoded.", sessionId, sourceKey: basename(descriptor.path) });
+      }
+    }
+    return segments;
   }
 
-  listTurnIdentityAliases(): readonly TurnIdentityAlias[] {
+  segmentCount(sessionId: string): number {
+    return this.#descriptors.get(sessionId)?.length ?? 0;
+  }
+
+  countTurns(sessionId: string): number {
+    const descriptors = this.#descriptors.get(sessionId) ?? [];
+    const ids = new Set<string>();
+    for (const descriptor of descriptors) for (const id of descriptor.summary.turnIds) ids.add(id);
+    return ids.size || descriptors.reduce((count, descriptor) => count + descriptor.summary.turnCount, 0);
+  }
+
+  async listTurnIdentityAliases(): Promise<readonly TurnIdentityAlias[]> {
     const aliases: TurnIdentityAlias[] = [];
-    for (const [sessionId, segments] of this.#segments) projectRolloutTurns(sessionId, segments.slice().sort(compareSegments), this.#options.diagnostics, aliases);
+    // Rebuild aliases from metadata. This keeps startup migration lazy; full turn
+    // decoding remains reserved for an explicit legacy lookup.
+    for (const [sessionId, descriptors] of this.#descriptors) {
+      let offset = 0;
+      for (const descriptor of descriptors.slice().sort(compareDescriptors)) {
+        for (const ordinal of descriptor.summary.legacyBoundaryOrdinals) {
+          const key = `legacy:${ordinal}`;
+          const displayOrdinal = offset + Math.max(1, descriptor.summary.turnIds.indexOf(key) + 1);
+          aliases.push({ providerId: "codex", sessionId, oldNativeTurnId: legacyRecoveredTurnId(descriptor.path, ordinal), newNativeTurnId: recoveredTurnId(sessionId, descriptor.segmentIdentity, ordinal), displayOrdinal, boundaryRecordOrdinal: ordinal });
+        }
+        offset += descriptor.summary.turnCount;
+      }
+    }
     return aliases;
   }
 }
 
-function buildSegments(files: ReadonlyMap<string, FileState>): Map<string, Segment[]> {
-  const segments = new Map<string, Segment[]>();
-  for (const file of files.values()) {
-    for (const sessionId of file.sessionIds) {
-      const values = segments.get(sessionId) ?? [];
-      values.push({
-        path: file.path,
-        archived: file.archived,
-        records: file.decoded.records,
-        partial: file.decoded.partialTail,
-        sessionId,
-        segmentIdentity: stableSegmentIdentity(sessionId, file.decoded.identityPrefixHash),
-        registryFileId: file.registryFileId,
-      });
-      segments.set(sessionId, values);
-    }
+interface MetadataScan {
+  readonly summaries: readonly SessionSummary[];
+  readonly checkpoint: RolloutCheckpoint;
+  readonly identityPrefixHash: string;
+  readonly contentStamp: string;
+  readonly partialTail: boolean;
+  readonly bytesRead: number;
+}
+
+function emptyCheckpoint(): RolloutCheckpoint {
+  return { decoderVersion: DECODER_VERSION, observedEof: 0, committedOffset: 0, physicalLineCount: 0, headHash: hash(Buffer.alloc(0)), tailOffset: 0, tailHash: hash(Buffer.alloc(0)) };
+}
+
+function metadataFromRecords(records: readonly DecodedRecord[], checkpoint: RolloutCheckpoint, identityPrefixHash: string, partialTail: boolean, archived: boolean, bytesRead: number): MetadataScan {
+  const accumulator = createSummaryAccumulator(archived);
+  for (const record of records) consumeSummaryRecord(accumulator, record);
+  const summaries = finalizeSummaries(accumulator);
+  return { summaries, checkpoint, identityPrefixHash, partialTail, bytesRead, contentStamp: digest(["rollout-content-v1", ...records.map((record) => `${record.ordinal}:${JSON.stringify(record.value)}`)]) };
+}
+
+function appendMetadata(previous: FileState, decoded: DecodedRollout, archived: boolean): MetadataScan {
+  const accumulator = createSummaryAccumulator(archived);
+  for (const summary of previous.summaries) accumulator.sessions.set(summary.id, {
+    id: summary.id,
+    title: summary.title,
+    preview: summary.preview,
+    cwds: new Set(summary.cwds),
+    projectId: summary.projectId,
+    createdAtMs: summary.createdAtMs,
+    updatedAtMs: summary.updatedAtMs,
+    archived: summary.archived,
+    source: summary.source,
+    historyMode: summary.historyMode,
+    parentSessionId: summary.parentSessionId,
+    originTurnId: summary.originTurnId,
+    turnKeys: new Set(summary.turnIds),
+    legacyBoundaries: new Set(summary.legacyBoundaryOrdinals),
+    currentIsNative: false,
+    currentHasInput: false,
+  });
+  accumulator.currentSessionId = previous.summaries[0]?.id;
+  for (const record of decoded.records) consumeSummaryRecord(accumulator, record);
+  const identityPrefixHash = decoded.identityPrefixHash || previous.checkpoint.identityPrefixHash || "";
+  return { summaries: finalizeSummaries(accumulator), checkpoint: decoded.checkpoint, identityPrefixHash, partialTail: decoded.partialTail, bytesRead: decoded.bytesRead, contentStamp: digest([previous.contentStamp, ...decoded.records.map((record) => `${record.ordinal}:${JSON.stringify(record.value)}`), decoded.partialTail ? "partial" : "committed"]) };
+}
+
+function createSummaryAccumulator(archived: boolean): SummaryAccumulator {
+  return { archived, sessions: new Map(), currentSessionId: undefined, firstCommittedRecordHash: undefined, firstMetaHash: undefined, firstBoundaryHash: undefined };
+}
+
+function consumeSummaryRecord(accumulator: SummaryAccumulator, record: DecodedRecord): void {
+  const value = record.value;
+  const payload = isRecord(value.payload) ? value.payload : value;
+  if (value.type === "session_meta" && isRecord(value.payload)) {
+    const meta = value.payload;
+    const id = stringValue(meta.id);
+    if (!id) return;
+    accumulator.currentSessionId = id;
+    const existing = accumulator.sessions.get(id);
+    const state = existing ?? { id, cwds: new Set<string>(), archived: accumulator.archived, turnKeys: new Set<string>(), legacyBoundaries: new Set<number>(), currentIsNative: false, currentHasInput: false };
+    state.archived = state.archived || accumulator.archived;
+    const cwd = stringValue(meta.cwd); if (cwd) state.cwds.add(cwd);
+    state.projectId ??= stringValue(meta.project_id);
+    state.source ??= sourceText(meta.source ?? meta.originator);
+    state.historyMode ??= stringValue(meta.history_mode);
+    state.parentSessionId ??= findNestedString(meta, new Set(["parent_thread_id", "parent_session_id", "forked_from", "forkedFromId"]));
+    state.originTurnId ??= findNestedString(meta, new Set(["origin_turn_id", "originTurnId", "last_turn_id", "lastTurnId"]));
+    const time = eventTimestamp(value); if (time !== undefined) { state.createdAtMs = state.createdAtMs === undefined ? time : Math.min(state.createdAtMs, time); state.updatedAtMs = state.updatedAtMs === undefined ? time : Math.max(state.updatedAtMs, time); }
+    accumulator.sessions.set(id, state);
+    return;
   }
-  return segments;
+  const sessionId = accumulator.currentSessionId;
+  if (!sessionId) return;
+  const state = accumulator.sessions.get(sessionId);
+  if (!state) return;
+  const time = eventTimestamp(value); if (time !== undefined) { state.createdAtMs = state.createdAtMs === undefined ? time : Math.min(state.createdAtMs, time); state.updatedAtMs = state.updatedAtMs === undefined ? time : Math.max(state.updatedAtMs, time); }
+  const outerType = stringValue(value.type) ?? "";
+  const eventType = stringValue(payload.type) ?? outerType;
+  if (outerType === "event_msg") {
+    if (eventType === "task_started") {
+      const id = stringValue(payload.turn_id) ?? `legacy:${record.ordinal}`;
+      state.turnKeys.add(id); state.currentId = id; state.currentIsNative = Boolean(stringValue(payload.turn_id)); state.currentHasInput = false;
+    } else if (eventType === "task_complete" || eventType === "turn_aborted" || eventType === "task_aborted") {
+      const id = stringValue(payload.turn_id) ?? state.currentId ?? `legacy:${record.ordinal}`;
+      state.turnKeys.add(id); state.currentId = undefined; state.currentIsNative = false; state.currentHasInput = false;
+    } else if (eventType === "user_message") {
+      if (!state.currentId) { state.currentId = `legacy:${record.ordinal}`; state.turnKeys.add(state.currentId); state.legacyBoundaries.add(record.ordinal); }
+      state.currentHasInput = true; state.title ??= userText(value); state.preview ??= userText(value);
+    }
+  } else if (outerType === "response_item") {
+    const isUser = payload.type === "message" && payload.role === "user";
+    if (isUser && (!state.currentId || (!state.currentIsNative && state.currentHasInput))) { state.currentId = `legacy:${record.ordinal}`; state.turnKeys.add(state.currentId); state.legacyBoundaries.add(record.ordinal); state.currentIsNative = false; state.currentHasInput = true; }
+    if (isUser) { state.title ??= userText(value); state.preview ??= userText(value); }
+  }
 }
 
-function extractSessionIds(records: readonly DecodedRecord[]): string[] {
-  const metadata = records.filter((record) => record.value.type === "session_meta" && isRecord(record.value.payload));
-  return [...new Set(metadata.map((record) => stringValue((record.value.payload as Record<string, unknown>).id)).filter((id): id is string => Boolean(id)))];
+function finalizeSummaries(accumulator: SummaryAccumulator): SessionSummary[] {
+  return [...accumulator.sessions.values()].map((state) => ({ id: state.id, ...(state.title ? { title: compactText(state.title) } : {}), ...(state.preview ? { preview: compactText(state.preview) } : {}), cwds: [...state.cwds], ...(state.projectId ? { projectId: state.projectId } : {}), ...(state.createdAtMs !== undefined ? { createdAtMs: state.createdAtMs } : {}), ...(state.updatedAtMs !== undefined ? { updatedAtMs: state.updatedAtMs } : {}), archived: state.archived, ...(state.source ? { source: state.source } : {}), ...(state.historyMode ? { historyMode: state.historyMode } : {}), ...(state.parentSessionId ? { parentSessionId: state.parentSessionId } : {}), ...(state.originTurnId ? { originTurnId: state.originTurnId } : {}), turnCount: state.turnKeys.size, turnIds: [...state.turnKeys], legacyBoundaryOrdinals: [...state.legacyBoundaries] }));
 }
 
-function decodedContentStamp(decoded: DecodedRollout): string {
-  return digest(decoded.records.map((record) => `${record.ordinal}:${JSON.stringify(record.value)}`));
+function registrySummary(summary: RolloutRegistrySessionSummary, id: string, archived: boolean): SessionSummary {
+  return { id, ...(summary.title ? { title: summary.title } : {}), ...(summary.preview ? { preview: summary.preview } : {}), cwds: summary.cwds, ...(summary.projectId ? { projectId: summary.projectId } : {}), ...(summary.createdAtMs !== undefined ? { createdAtMs: summary.createdAtMs } : {}), ...(summary.updatedAtMs !== undefined ? { updatedAtMs: summary.updatedAtMs } : {}), archived: summary.archived || archived, ...(summary.source ? { source: summary.source } : {}), ...(summary.historyMode ? { historyMode: summary.historyMode } : {}), ...(summary.parentSessionId ? { parentSessionId: summary.parentSessionId } : {}), ...(summary.originTurnId ? { originTurnId: summary.originTurnId } : {}), turnCount: summary.turnCount, turnIds: summary.turnIds, legacyBoundaryOrdinals: summary.legacyBoundaryOrdinals };
+}
+
+async function scanRolloutMetadata(path: string, archived: boolean, diagnostics: DiagnosticCollector): Promise<MetadataScan> {
+  const handle = await open(path, "r");
+  try {
+    const observedEof = (await handle.stat()).size;
+    const decoder = new StringDecoder("utf8");
+    const accumulator = createSummaryAccumulator(archived);
+    const content = createHash("sha256");
+    const chunk = Buffer.alloc(64 * 1024);
+    let pending = "";
+    let bytesRead = 0;
+    let committedOffset = 0;
+    let physicalLineCount = 0;
+    let firstMetaHash: string | undefined;
+    let firstBoundaryHash: string | undefined;
+    let firstCommittedRecordHash: string | undefined;
+    const consumeLine = (rawLine: string): void => {
+      const raw = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+      physicalLineCount += 1;
+      if (!raw) return;
+      if (Buffer.byteLength(raw) > MAX_LINE_BYTES) { diagnostics.add({ code: "corrupt_line", severity: "warning", message: "A committed rollout line exceeded the decoder limit.", sourceKey: basename(path), ordinal: physicalLineCount }); return; }
+      try {
+        const value: unknown = JSON.parse(raw);
+        if (!isRecord(value)) throw new Error("record is not an object");
+        const rawHash = digest([raw]);
+        firstCommittedRecordHash ??= rawHash;
+        if (!firstMetaHash && value.type === "session_meta") firstMetaHash = rawHash;
+        if (!firstBoundaryHash && isLegacyBoundary(value)) firstBoundaryHash = rawHash;
+        consumeSummaryRecord(accumulator, { ordinal: physicalLineCount, value });
+      } catch { diagnostics.add({ code: "corrupt_line", severity: "warning", message: "A malformed committed rollout line was skipped.", sourceKey: basename(path), ordinal: physicalLineCount }); }
+    };
+    let position = 0;
+    while (position < observedEof) {
+      const { bytesRead: read } = await handle.read(chunk, 0, chunk.length, position);
+      if (!read) break;
+      const bytes = chunk.subarray(0, read);
+      content.update(bytes); bytesRead += read; position += read;
+      pending += decoder.write(bytes);
+      let newline = pending.indexOf("\n");
+      while (newline >= 0) {
+        const line = pending.slice(0, newline); pending = pending.slice(newline + 1);
+        committedOffset += Buffer.byteLength(line) + 1;
+        consumeLine(line);
+        newline = pending.indexOf("\n");
+      }
+    }
+    pending += decoder.end();
+    const partialTail = pending.length > 0;
+    if (partialTail) diagnostics.add({ code: "partial_line", severity: "info", message: "An unterminated final rollout line remains uncommitted.", sourceKey: basename(path), ordinal: physicalLineCount + 1 });
+    const head = await readWindow(handle, 0, Math.min(PROBE_BYTES, observedEof));
+    const tailOffset = Math.max(0, observedEof - PROBE_BYTES);
+    const tail = await readWindow(handle, tailOffset, observedEof - tailOffset);
+    const identityPrefixHash = digest([firstMetaHash ?? firstCommittedRecordHash ?? "empty", firstBoundaryHash ?? "empty"]);
+    const checkpoint: RolloutCheckpoint = { decoderVersion: DECODER_VERSION, observedEof, committedOffset, physicalLineCount, headHash: hash(head), tailOffset, tailHash: hash(tail), identityPrefixHash };
+    return { summaries: finalizeSummaries(accumulator), checkpoint, identityPrefixHash, partialTail, bytesRead: bytesRead + head.length + tail.length, contentStamp: digest(["rollout-content-v1", content.digest("hex")]) };
+  } finally { await handle.close(); }
+}
+
+function buildDescriptors(files: ReadonlyMap<string, FileState>): Map<string, SegmentDescriptor[]> {
+  const descriptors = new Map<string, SegmentDescriptor[]>();
+  for (const file of files.values()) for (const summary of file.summaries) {
+    const values = descriptors.get(summary.id) ?? [];
+    values.push({ path: file.path, archived: file.archived, partial: file.checkpoint.committedOffset !== file.checkpoint.observedEof, sessionId: summary.id, segmentIdentity: stableSegmentIdentity(summary.id, file.checkpoint.identityPrefixHash ?? ""), registryFileId: file.registryFileId, checkpoint: file.checkpoint, summary });
+    descriptors.set(summary.id, values);
+  }
+  return descriptors;
+}
+
+function compareDescriptors(a: SegmentDescriptor, b: SegmentDescriptor): number {
+  return (a.summary.createdAtMs ?? 0) - (b.summary.createdAtMs ?? 0) || a.path.localeCompare(b.path);
+}
+
+function projectSummary(sessionId: string, descriptors: readonly SegmentDescriptor[]): CodexThreadRecord {
+  const summaries = descriptors.map((descriptor) => descriptor.summary);
+  const cwds = unique(summaries.flatMap((summary) => summary.cwds));
+  const firstUser = summaries.map((summary) => summary.title ?? summary.preview).find(Boolean);
+  const createdAtMs = summaries.map((summary) => summary.createdAtMs).filter((value): value is number => value !== undefined).sort((a, b) => a - b)[0];
+  const updatedAtMs = summaries.map((summary) => summary.updatedAtMs).filter((value): value is number => value !== undefined).sort((a, b) => b - a)[0];
+  const parent = summaries.map((summary) => summary.parentSessionId).find(Boolean);
+  const originTurn = summaries.map((summary) => summary.originTurnId).find(Boolean);
+  const source = summaries.map((summary) => summary.source).find(Boolean);
+  return { id: sessionId, title: compactText(firstUser), preview: compactText(firstUser), cwd: cwds[0], observedCwds: cwds, projectId: summaries.map((summary) => summary.projectId).find(Boolean), createdAtMs, updatedAtMs, archived: summaries.every((summary) => summary.archived), source, historyMode: summaries.map((summary) => summary.historyMode).find(Boolean), rolloutPaths: descriptors.map((descriptor) => descriptor.path), physicalSegmentCount: descriptors.length, sourceTier: "reconciliation", partial: descriptors.some((descriptor) => descriptor.partial), nativeLineage: parent ? { providerId: "codex", sessionId, parentSessionId: parent, ...(originTurn ? { originTurnId: originTurn } : {}), kind: /subagent/i.test(source ?? "") ? "subagent_spawn" : /history/i.test(source ?? "") ? "history_base" : originTurn ? "user_fork" : "unknown_native", recovery: originTurn ? "exact" : "session_only" } : undefined };
 }
 
 function pathKey(path: string): string {
@@ -267,21 +520,31 @@ async function probeUnchanged(path: string, checkpoint: RolloutCheckpoint): Prom
   } catch { return false; }
 }
 
+async function canAppend(path: string, checkpoint: RolloutCheckpoint): Promise<boolean> {
+  try {
+    const handle = await open(path, "r");
+    try {
+      const size = (await handle.stat()).size;
+      return size > checkpoint.observedEof && checkpoint.decoderVersion === DECODER_VERSION && await checkpointMatches(handle, checkpoint);
+    } finally { await handle.close(); }
+  } catch { return false; }
+}
+
 async function registryInputs(
   files: ReadonlyMap<string, FileState>,
-  segmentsBySession: ReadonlyMap<string, readonly Segment[]>,
+  descriptorsBySession: ReadonlyMap<string, readonly SegmentDescriptor[]>,
 ): Promise<RolloutRegistryFileInput[]> {
   const inputs: RolloutRegistryFileInput[] = [];
   for (const file of files.values()) {
     const segments: RolloutRegistryFileInput["sessions"] = [];
-    for (const [sessionId, sessionSegments] of segmentsBySession) {
-      const ordered = sessionSegments.slice().sort(compareSegments);
-      ordered.forEach((segment, segmentOrder) => {
-        if (segment.path === file.path) segments.push({ sessionId, stableSegmentIdentity: segment.segmentIdentity, segmentOrder });
+    for (const [sessionId, sessionDescriptors] of descriptorsBySession) {
+      const ordered = sessionDescriptors.slice().sort(compareDescriptors);
+      ordered.forEach((descriptor, segmentOrder) => {
+        if (descriptor.path === file.path) segments.push({ sessionId, stableSegmentIdentity: descriptor.segmentIdentity, segmentOrder, summary: descriptor.summary });
       });
     }
     const fileStat = await stat(file.path).catch(() => undefined);
-    const checkpoint = file.decoded.checkpoint;
+    const checkpoint = file.checkpoint;
     inputs.push({
       registryFileId: file.registryFileId,
       canonicalPath: file.path,
@@ -290,6 +553,7 @@ async function registryInputs(
       size: checkpoint.observedEof,
       mtimeMs: fileStat?.mtimeMs ?? 0,
       sourceStamp: file.sourceStamp,
+      contentStamp: file.contentStamp,
       checkpoint,
       sessions: segments,
     });
@@ -297,11 +561,12 @@ async function registryInputs(
   return inputs;
 }
 
-export async function decodeRollout(path: string, checkpoint: RolloutCheckpoint | undefined, diagnostics: DiagnosticCollector): Promise<DecodedRollout> {
+export async function decodeRollout(path: string, checkpoint: RolloutCheckpoint | undefined, diagnostics: DiagnosticCollector, readLimit?: number): Promise<DecodedRollout> {
   const handle = await open(path, "r");
   try {
-    const observedEof = (await handle.stat()).size;
-    const append = checkpoint && checkpoint.decoderVersion === DECODER_VERSION && observedEof > checkpoint.observedEof && await checkpointMatches(handle, checkpoint);
+    const physicalEof = (await handle.stat()).size;
+    const observedEof = readLimit === undefined ? physicalEof : Math.min(readLimit, physicalEof);
+    const append = readLimit === undefined && checkpoint && checkpoint.decoderVersion === DECODER_VERSION && observedEof > checkpoint.observedEof && await checkpointMatches(handle, checkpoint);
     const start = append ? checkpoint.committedOffset : 0;
     const baseLine = append ? checkpoint.physicalLineCount : 0;
     const length = observedEof - start;

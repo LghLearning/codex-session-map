@@ -9,6 +9,24 @@ export interface RolloutRegistrySessionInput {
   readonly sessionId: string;
   readonly stableSegmentIdentity: string;
   readonly segmentOrder: number;
+  readonly summary?: RolloutRegistrySessionSummary;
+}
+
+export interface RolloutRegistrySessionSummary {
+  readonly title?: string;
+  readonly preview?: string;
+  readonly cwds: readonly string[];
+  readonly projectId?: string;
+  readonly createdAtMs?: number;
+  readonly updatedAtMs?: number;
+  readonly archived: boolean;
+  readonly source?: string;
+  readonly historyMode?: string;
+  readonly parentSessionId?: string;
+  readonly originTurnId?: string;
+  readonly turnCount: number;
+  readonly turnIds: readonly string[];
+  readonly legacyBoundaryOrdinals: readonly number[];
 }
 
 export interface RolloutRegistryFileInput {
@@ -19,6 +37,7 @@ export interface RolloutRegistryFileInput {
   readonly size: number;
   readonly mtimeMs: number;
   readonly sourceStamp: string;
+  readonly contentStamp?: string;
   readonly checkpoint: {
     readonly decoderVersion: number;
     readonly observedEof: number;
@@ -66,8 +85,8 @@ export class RolloutSourceRegistry {
         const upsert = db.prepare(`INSERT INTO rollout_files (
           registry_file_id, canonical_path, root_kind, stable_file_identity, size, mtime_ms,
           decoder_version, observed_eof, committed_offset, physical_line_count, head_hash,
-          tail_offset, tail_hash, identity_prefix_hash, source_stamp, updated_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+          tail_offset, tail_hash, identity_prefix_hash, source_stamp, content_stamp, updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(registry_file_id) DO UPDATE SET
           canonical_path=excluded.canonical_path, root_kind=excluded.root_kind,
           stable_file_identity=excluded.stable_file_identity, size=excluded.size,
@@ -76,9 +95,10 @@ export class RolloutSourceRegistry {
           physical_line_count=excluded.physical_line_count, head_hash=excluded.head_hash,
           tail_offset=excluded.tail_offset, tail_hash=excluded.tail_hash,
           identity_prefix_hash=excluded.identity_prefix_hash, source_stamp=excluded.source_stamp,
+          content_stamp=excluded.content_stamp,
           updated_at=excluded.updated_at`);
         const removeSessions = db.prepare("DELETE FROM rollout_file_sessions WHERE registry_file_id=?");
-        const insertSession = db.prepare("INSERT INTO rollout_file_sessions(registry_file_id,session_id,stable_segment_identity,segment_order) VALUES(?,?,?,?)");
+        const insertSession = db.prepare("INSERT INTO rollout_file_sessions(registry_file_id,session_id,stable_segment_identity,segment_order,summary_json) VALUES(?,?,?,?,?)");
         const now = new Date().toISOString();
         for (const file of files) {
           removePath.run(file.canonicalPath, file.registryFileId);
@@ -99,10 +119,11 @@ export class RolloutSourceRegistry {
             file.checkpoint.tailHash,
             file.checkpoint.identityPrefixHash ?? "",
             file.sourceStamp,
+            file.contentStamp ?? "",
             now,
           );
           removeSessions.run(file.registryFileId);
-          for (const session of file.sessions) insertSession.run(file.registryFileId, session.sessionId, session.stableSegmentIdentity, session.segmentOrder);
+          for (const session of file.sessions) insertSession.run(file.registryFileId, session.sessionId, session.stableSegmentIdentity, session.segmentOrder, JSON.stringify(session.summary ?? {}));
         }
         db.exec("COMMIT");
       } catch (error) {
@@ -116,11 +137,11 @@ export class RolloutSourceRegistry {
     const db = openDatabase(this.#databasePath);
     try {
       const rows = db.prepare("SELECT * FROM rollout_files ORDER BY canonical_path").all() as unknown as FileRow[];
-      const sessions = db.prepare("SELECT registry_file_id,session_id,stable_segment_identity,segment_order FROM rollout_file_sessions ORDER BY segment_order,session_id").all() as unknown as SessionRow[];
+      const sessions = db.prepare("SELECT registry_file_id,session_id,stable_segment_identity,segment_order,summary_json FROM rollout_file_sessions ORDER BY segment_order,session_id").all() as unknown as SessionRow[];
       const byFile = new Map<string, RolloutRegistrySessionInput[]>();
       for (const session of sessions) {
         const values = byFile.get(session.registry_file_id) ?? [];
-        values.push({ sessionId: session.session_id, stableSegmentIdentity: session.stable_segment_identity, segmentOrder: session.segment_order });
+        values.push({ sessionId: session.session_id, stableSegmentIdentity: session.stable_segment_identity, segmentOrder: session.segment_order, ...(parseSummary(session.summary_json) ? { summary: parseSummary(session.summary_json) } : {}) });
         byFile.set(session.registry_file_id, values);
       }
       return rows.map((row) => ({
@@ -131,6 +152,7 @@ export class RolloutSourceRegistry {
         size: row.size,
         mtimeMs: row.mtime_ms,
         sourceStamp: row.source_stamp,
+        ...(row.content_stamp ? { contentStamp: row.content_stamp } : {}),
         checkpoint: {
           decoderVersion: row.decoder_version,
           observedEof: row.observed_eof,
@@ -243,13 +265,15 @@ function ensureSchema(db: DatabaseSync): void {
       tail_hash TEXT NOT NULL,
       identity_prefix_hash TEXT NOT NULL DEFAULT '',
       source_stamp TEXT NOT NULL,
+      content_stamp TEXT NOT NULL DEFAULT '',
       updated_at TEXT NOT NULL
     );
   `);
+  ensureColumn(db, "rollout_files", "content_stamp", "TEXT NOT NULL DEFAULT ''");
   assertColumns(db, "rollout_files", [
     "registry_file_id", "canonical_path", "root_kind", "stable_file_identity", "size", "mtime_ms", "decoder_version",
     "observed_eof", "committed_offset", "physical_line_count", "head_hash", "tail_offset", "tail_hash",
-    "identity_prefix_hash", "source_stamp", "updated_at",
+    "identity_prefix_hash", "source_stamp", "content_stamp", "updated_at",
   ]);
   db.exec(`
     CREATE TABLE IF NOT EXISTS rollout_file_sessions (
@@ -257,10 +281,12 @@ function ensureSchema(db: DatabaseSync): void {
       session_id TEXT NOT NULL,
       stable_segment_identity TEXT NOT NULL,
       segment_order INTEGER NOT NULL,
+      summary_json TEXT NOT NULL DEFAULT '{}',
       PRIMARY KEY(registry_file_id,session_id)
     );
   `);
-  assertColumns(db, "rollout_file_sessions", ["registry_file_id", "session_id", "stable_segment_identity", "segment_order"]);
+  ensureColumn(db, "rollout_file_sessions", "summary_json", "TEXT NOT NULL DEFAULT '{}'");
+  assertColumns(db, "rollout_file_sessions", ["registry_file_id", "session_id", "stable_segment_identity", "segment_order", "summary_json"]);
   db.exec("CREATE INDEX IF NOT EXISTS rollout_files_root ON rollout_files(root_kind); CREATE INDEX IF NOT EXISTS rollout_file_sessions_session ON rollout_file_sessions(session_id);");
   db.prepare("INSERT INTO registry_meta(key,value) VALUES('schema_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(String(REGISTRY_SCHEMA_VERSION));
 }
@@ -288,7 +314,21 @@ interface FileRow {
   tail_hash: string;
   identity_prefix_hash: string;
   source_stamp: string;
+  content_stamp?: string;
   updated_at: string;
 }
 
-interface SessionRow { registry_file_id: string; session_id: string; stable_segment_identity: string; segment_order: number }
+interface SessionRow { registry_file_id: string; session_id: string; stable_segment_identity: string; segment_order: number; summary_json?: unknown }
+
+function parseSummary(raw: unknown): RolloutRegistrySessionInput["summary"] {
+  if (typeof raw !== "string" || !raw || raw === "{}") return undefined;
+  try {
+    const value: unknown = JSON.parse(raw);
+    return isRecord(value) && Array.isArray(value.cwds) && Array.isArray(value.turnIds) && Array.isArray(value.legacyBoundaryOrdinals) && typeof value.archived === "boolean" && typeof value.turnCount === "number" ? value as RolloutRegistrySessionSummary : undefined;
+  } catch { return undefined; }
+}
+
+function ensureColumn(db: DatabaseSync, table: string, column: string, definition: string): void {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as { name?: unknown }[];
+  if (!columns.some((item) => item.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}

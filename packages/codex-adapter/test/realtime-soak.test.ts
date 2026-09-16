@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { CodexAdapterV1 } from "../src/adapter.ts";
+import { decodeRollout } from "../src/rollout-source.ts";
 
 test("repeated appends reconcile without duplicate sessions or native turns", async (t) => {
   const home = await fixtureHome(t);
@@ -63,6 +64,35 @@ test("future and missing optional fields fail soft with diagnostics", async (t) 
   assert.equal((await adapter.readSession("session-skew")).providerSessionId, "session-skew");
   await adapter.listTurns("session-skew");
   assert.equal(adapter.getDiagnostics().some((item) => item.code === "unknown_event"), true);
+});
+
+test("a changed-file decode failure retains the current generation and emits no provider update", async (t) => {
+  const home = await fixtureHome(t);
+  const rollout = join(home, "sessions", "2026", "01", "02", "rollout-modern-b.jsonl");
+  let fail = false;
+  const adapter = new CodexAdapterV1({
+    codexHome: home,
+    disableAppServer: true,
+    watchDebounceMs: 20,
+    reconciliationIntervalMs: 200,
+    decodeRollout: async (path, checkpoint, diagnostics) => {
+      if (fail && checkpoint) throw new Error("deterministic append decode failure");
+      return decodeRollout(path, checkpoint, diagnostics);
+    },
+  });
+  await adapter.listWorkspaceScopes();
+  const before = await allPages((cursor) => adapter.listTurns("session-modern", cursor));
+  const updates: { revision: number; reason: string; affected?: readonly string[] }[] = [];
+  const unsubscribe = await adapter.subscribeUpdates((update) => updates.push({ revision: update.revision, reason: update.reason, affected: update.affectedSessionIds }));
+  t.after(unsubscribe);
+  fail = true;
+  await appendFile(rollout, turnLines("turn-rejected", "2026-01-02T00:03:00.000Z"));
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  const after = await allPages((cursor) => adapter.listTurns("session-modern", cursor));
+  assert.deepEqual(after.map((turn) => turn.nativeTurnId), before.map((turn) => turn.nativeTurnId));
+  if (updates.length) console.log("deterministic updates", updates, adapter.getDiagnostics());
+  assert.equal(updates.length, 0);
+  assert.equal(adapter.getDiagnostics().some((item) => item.code === "corrupt_line"), true);
 });
 
 function turnLines(turnId: string, timestamp: string): string {
