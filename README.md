@@ -1,135 +1,160 @@
 # Codex Session Map
 
-Codex Session Map turns scattered Codex sessions into an editable semantic forest.
+**Turn scattered OpenAI Codex sessions into a searchable, editable map of your work.**
+
+After a project grows to dozens of Codex sessions, a flat history list stops showing how the work evolved. Codex Session Map helps you find old decisions, follow relationships between Sessions and Turns, and organize long-running Codex work without modifying the original Codex history.
+
+Local-first · Read-only Codex history · Searchable · User-editable · AI optional
+
+## See the shape of your work
+
+The default `/` entry is a React Map Workspace. It keeps Session relationships visible, expands a Session into its ordered Turn chain, and lets a child Session branch from the Turn where the work became related. Search and the Turn Reader then take you back to an exact native Turn.
+
+The repository also retains this screenshot of the legacy Forest view as a visual reference:
+
+![Legacy Forest view](docs/assets/session-forest-alpha.png)
+
+An updated screenshot of the React Map Workspace would make the current experience clearer; no fabricated image is included here.
+
+## Why Codex Session Map?
+
+Codex makes it easy to start a new Session, but long-running work soon becomes scattered across continuations, side investigations, and subtasks. The important decision may be in one Turn, while the Session that followed it has a completely different title.
+
+Codex Session Map turns that history into a structure you can revisit:
 
 ```text
-Turn Semantic Traces
-  → Semantic Session Titles
-  → Semantic Parent Relationships
-  → Editable Session Forest
+Project
+├── Main investigation
+│   ├── Session A
+│   │   ├── Turn 1
+│   │   └── Turn 2
+│   │       └── Session B
+│   └── Session C
+└── Another workstream
 ```
 
-Codex history remains read-only. AI metadata and user corrections are stored locally in a separate application database.
+It is designed for finding past work, understanding how Sessions relate, correcting the organization, and returning to the exact discussion that matters.
 
-![Codex Session Map v0.2.0-beta.1](docs/assets/session-forest-alpha.png)
+## What you can do
 
-## What it does
+### Map long-running work
 
-- Groups local Codex Sessions by Workspace.
-- Reconstructs native Turns, tools, archives, segmented rollouts, and Native Lineage.
-- Generates concise Simplified-Chinese Turn traces with local Ollama/qwen3.5.
-- Generates stable Session titles and continuation/subtask/root relationships.
-- Organizes one explicitly selected Workspace into a multi-root Forest.
-- Keeps Unorganized Sessions separate from confirmed semantic Roots.
-- Lets the user rename Sessions, edit Turn labels, change parents, or set a Session as Root without generating AI suggestions first.
-- Supports Restore automatic and revision-protected Undo for manual edits.
-- Preserves the original transcript beside all generated metadata.
+Organize Codex Sessions into an editable multi-root work map. Session chains remain separate from side branches and unorganized history.
 
-Native Lineage records how Codex Sessions were created. Semantic placement records how those Sessions relate as work. They remain separate.
+### Find anything again
 
-## Requirements
+Search the current Workspace and jump from a result to the exact Session and native Turn that contains it.
 
-- Windows for the verified beta path. Linux/macOS watcher behavior is not yet verified.
-- Node.js 24 or newer.
-- A local Codex installation with existing Session history.
-- Optional for AI generation: [Ollama](https://ollama.com/) and `qwen3.5`.
+### Read work in context
 
-History browsing, Forest data, and manual organization remain available when Ollama is offline. Only AI generation requires the model.
+Expand a Session into its ordered Turn sequence, open the full Turn content, and move to neighboring Turns without loading an entire transcript into the page.
 
-## Recent updates
+### Organize it yourself
 
-- The React Map Workspace is now the default `/` entry. Search and the Turn Reader locate and open exact native Turns; the previous Explorer remains available at `/legacy`.
-- Full Turn content now preserves long text, whitespace, and formatting independently of bounded previews. Displayed Turn numbers remain consecutive across pagination, and native Turn IDs support exact reads.
-- Derived fingerprints detect full-content changes, including text outside AI prompt samples. Older cached suggestions may appear stale after upgrading; stored suggestions and user values are retained.
-- User titles, Turn labels, and parent placement are persisted independently of AI records. Manual parent selection covers all legal Sessions in the Workspace, with time-direction and cycle checks.
-- Undo checks the current revision before restoring a previous user value. Restore automatic clears an override while retaining the AI suggestion. Ctrl+Z inside text inputs keeps the browser's text-editing behavior.
-- Forest trace content and counts update as generation completes, without reloading the page. Trace cards now follow the active color theme.
-- Organization progress is streamed over the existing SSE endpoint with revision protection; a low-frequency polling fallback remains for recovery. Node 24 is checked before tests, builds, and startup.
+Rename Sessions, edit Turn labels, move Sessions, set roots, attach a Session to a specific Turn, restore automatic suggestions, and undo recent manual changes. User corrections remain authoritative.
 
-Restart the server after updating. The application upgrades its local semantic database to schema 5 transactionally, preserving existing user titles, parent choices, trace edits, and review states. No Codex source database is modified.
+### Let AI help — optionally
 
-## Installation
+Local Ollama can suggest Turn traces, Session titles, and relationships. Manual organization, browsing, Search, and Reader do not require the model.
 
-Clone or download this repository, then run:
+Codex source history is opened read-only throughout these flows.
+
+## More than a transcript viewer
+
+Typical transcript viewers help inspect individual Sessions. Codex Session Map focuses on organizing long-running work across Sessions while keeping the original history intact.
+
+| Capability | Basic transcript/session viewer | Codex Session Map |
+| --- | --- | --- |
+| Read past transcripts | ✓ | ✓ |
+| Search history | often | ✓ |
+| Browse Sessions | ✓ | ✓ |
+| Editable cross-Session work map | — | ✓ |
+| Attach a Session to a specific Turn | — | ✓ |
+| User-correctable relationship structure | — | ✓ |
+| Multi-root long-running Workspace organization | — | ✓ |
+
+## Quick Start
+
+The verified Beta path is Windows with Node.js 24 or newer:
 
 ```powershell
 git clone https://github.com/LghLearning/codex-session-map.git
 cd codex-session-map
 corepack enable
 pnpm install --frozen-lockfile
-```
-
-No Electron, Tauri, installer framework, remote service, or cloud account is required.
-
-## Start
-
-The Windows launcher validates Node, starts the loopback-only server, waits for readiness, and opens the local UI:
-
-```powershell
 .\start-session-map.ps1
 ```
 
-Useful options:
+Open [http://127.0.0.1:4319](http://127.0.0.1:4319) if the launcher does not open the browser. The default page is the React Map Workspace; the retained legacy Explorer is available at `/legacy`.
 
-```powershell
-.\start-session-map.ps1 -NoBrowser
-.\start-session-map.ps1 -Fallback
-.\start-session-map.ps1 -Port 4321
-.\start-session-map.ps1 -NodePath C:\path\to\node.exe
-```
-
-Or start directly:
-
-```text
-pnpm start
-pnpm start:fallback
-```
-
-The default URL is `http://127.0.0.1:4319`. It opens the React Map Workspace; the previous Explorer remains available at `/legacy` during the migration.
-
-## Organize a Workspace
-
-1. Select a Workspace.
-2. Open the Map Workspace, or use the legacy **Forest** view.
-3. Click **Organize** / **Organize Workspace**.
-4. Review the generated titles and relationships.
-5. Use **Rename**, **Edit label**, **Change parent**, or **Set root** to organize directly, even without AI results. **Restore automatic** clears your override; **Undo** reverses your recent manual change.
-
-Organization is explicit, current-Workspace-only, cancellable, and safe to rerun. It reuses existing titles and parents, preserves user corrections, continues after individual Session failures, and never starts full-history Turn Trace generation.
-
-## Local Ollama setup
+Ollama is optional. Map, Search, Reader, and manual organization work without AI. Add Ollama only when you want local generation:
 
 ```text
 ollama pull qwen3.5
 ollama serve
 ```
 
-Runtime contract:
+Useful launcher options include `-NoBrowser`, `-Fallback`, `-Port 4321`, and `-NodePath C:\path\to\node.exe`.
+
+## How it works
+
+The user-facing model is simple:
 
 ```text
-Endpoint: http://127.0.0.1:11434
-Model: qwen3.5
-Thinking: OFF
-Temperature: 0
-Remote fallback: none
+Workspace
+  → Sessions
+    → ordered Turns
+      → child Session branches
 ```
 
-The startup status bar and Diagnostics show whether history, the semantic store, Ollama, and the model are ready.
+Each Turn keeps a stable native identity. Its displayed label can come from a user label, an AI trace, or a public input preview. A Session's display title follows the same user-first rule. Native Lineage records how Codex created Sessions; Semantic placement records how you choose to organize them, and the two remain separate.
 
-## Data and privacy
+The default map is backed by a local read-only source adapter, a rebuildable local Search index, an app-owned semantic store, and a deterministic Session Forest. Filesystem watchers improve update latency while periodic reconciliation remains the correctness path.
 
-Codex sources are opened read-only. The application does not resume, fork, archive, rename, delete, or modify Codex Sessions.
+## AI is optional
 
-Application-owned data lives under:
+The application uses a local Ollama endpoint at `http://127.0.0.1:11434` with `qwen3.5` when generation is enabled. There is no remote model fallback. If Ollama is unavailable, the application still exposes the source history, map, Search, Reader, manual edits, and Undo.
+
+AI records are suggestions. User titles, labels, placements, and review decisions are durable local state and take precedence over later AI regeneration.
+
+## Data & privacy
+
+Codex sources are opened read-only. The application does not resume, fork, archive, rename, delete, or modify Codex Sessions, rollout files, or the Codex source database. No remote service or cloud account is required.
+
+Application-owned state is kept under `.codex-session-map/`:
 
 ```text
 .codex-session-map/
-└── semantic-traces.sqlite
+├── semantic-traces.sqlite   # AI records and authoritative user edits
+├── organization.sqlite      # local organization job state
+├── search.sqlite            # rebuildable Workspace Search index
+└── source-registry.sqlite   # rebuildable source metadata
 ```
 
-The database contains Semantic Traces, Semantic Session Titles, Semantic Parent records, and authoritative user corrections. AI records are derived; user edits are not disposable cache data.
+Search and source metadata can be rebuilt. User overrides in `semantic-traces.sqlite` are authoritative and should be backed up. Stop the application and copy the entire `.codex-session-map/` directory to back up local state.
 
-To back it up, stop the application and copy the entire `.codex-session-map/` directory.
+## Requirements and Beta support
+
+- **Verified Beta path:** Windows.
+- **Runtime:** Node.js 24 or newer.
+- **Package manager:** pnpm 11.19.0 through Corepack.
+- **Source:** an existing local Codex installation with Session history.
+- **AI:** optional Ollama and `qwen3.5`.
+
+Linux and macOS watcher behavior is not yet verified. The application is currently released as `v0.2.0-beta.1`.
+
+## Known limitations
+
+- Codex currently reports `openSession=false` and `openTurn=false`; the companion transcript and Copy Session ID are the supported read-only fallback.
+- Semantic Parent inference can fail closed when a model result falls outside the legal candidate set. Rerunning retries only missing records.
+- Reparenting uses a dialog rather than drag-and-drop.
+- Sessions without an AI or user placement remain explicitly Unorganized rather than being silently treated as Roots.
+- When Ollama is offline, manual titles, labels, relationships, and Undo remain available. Generation is disabled; restart after restoring Ollama to enable it again.
+- Large cold Workspace materialization can take several seconds.
+- Workspace organization does not generate missing Turn Traces.
+- A first Search on a new Workspace may show incomplete coverage while the local index catches up.
+- Non-Windows watcher behavior is unverified.
+- Undo history begins with edits made through the current manual controls; pre-upgrade actions are not reconstructed as undoable history.
 
 ## Architecture
 
@@ -144,20 +169,9 @@ Codex App Server (preferred)
   → local web companion
 ```
 
-Filesystem watchers reduce update latency. Periodic reconciliation remains the correctness path.
+The adapter preserves full public Turn content, stable native Turn identity, archives, hidden-agent state, segmented rollouts, and Native Lineage. Derived semantic records and Search documents are local and rebuildable; the original Codex history remains the source of truth.
 
-## Known limitations
-
-- Codex currently reports `openSession=false` and `openTurn=false`; the companion transcript and Copy Session ID are the supported fallback.
-- Semantic Parent inference can fail closed when the model returns a Session outside the candidate set. Rerunning retries only missing records.
-- Reparenting uses a dialog rather than drag-and-drop.
-- Sessions without an AI or user placement remain explicitly Unorganized; they are not silently treated as user-confirmed Roots.
-- When Ollama is offline, manual titles, labels, relationships, and Undo remain available. Generation is disabled; restart after restoring Ollama to enable it again.
-- Large cold Workspace materialization can take several seconds.
-- Workspace organization does not generate missing Turn Traces.
-- Search indexing is local and rebuildable. A first search on a new Workspace may show incomplete coverage while the index catches up.
-- Non-Windows watcher behavior is unverified.
-- Undo history starts with edits made through the new manual controls; pre-upgrade actions are not reconstructed as undoable history.
+See [Architecture](docs/architecture.md), [Source precedence](docs/source-precedence.md), and [Operations and recovery](docs/operations.md) for implementation and recovery details.
 
 ## Development
 
@@ -168,6 +182,8 @@ pnpm benchmark:transcript
 pnpm benchmark:reconciliation
 ```
 
-See [Architecture](docs/architecture.md), [Source precedence](docs/source-precedence.md), and [Operations and recovery](docs/operations.md) for implementation and recovery details.
+The repository uses Node 24 and pnpm 11.19.0. The public snapshot excludes local databases, user corrections, private conversation content, and real-session evaluation reports. The included screenshot and test fixtures use synthetic demonstration data.
 
-This public repository starts from a privacy-reviewed source snapshot. Internal development history, real-session evaluation reports, local databases, user corrections, and private conversation content are deliberately excluded. The screenshot and test fixtures use synthetic demonstration data.
+## Release notes
+
+See [CHANGELOG.md](CHANGELOG.md) for the `v0.2.0-beta.1` release notes. The Beta includes the React Map Workspace, Search and exact Turn Reader, independent user overrides and Undo, Turn-anchored branches, progressive local organization, Windows/Node 24 hardening, and clearer offline/indexing states.
