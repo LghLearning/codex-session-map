@@ -37,7 +37,7 @@ try {
     } catch { Start-Sleep -Milliseconds 250 }
   }
   if (-not $ready) { throw "Codex Session Map did not become ready at $url." }
-  Write-Host "Codex Session Map v0.1.0-alpha is ready: $url"
+  Write-Host "Codex Session Map v0.2.0-beta.1 is ready: $url"
   Write-Host "Server PID: $($server.Id). Press Ctrl+C to stop."
   if (-not $NoBrowser) { Start-Process $url }
   Wait-Process -Id $server.Id
