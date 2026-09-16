@@ -10,11 +10,9 @@ Local-first · Read-only Codex history · Searchable · User-editable · AI opti
 
 The default `/` entry is a React Map Workspace. It keeps Session relationships visible, expands a Session into its ordered Turn chain, and lets a child Session branch from the Turn where the work became related. Search and the Turn Reader then take you back to an exact native Turn.
 
-The repository also retains this screenshot of the legacy Forest view as a visual reference:
+![React Map Workspace](docs/assets/session-map-react-beta.png)
 
-![Legacy Forest view](docs/assets/session-forest-alpha.png)
-
-An updated screenshot of the React Map Workspace would make the current experience clearer; no fabricated image is included here.
+This screenshot uses sanitized demonstration data and shows the current Map Workspace with Session relationships and an expanded Turn chain. The repository also retains the older Forest screenshot as a legacy visual reference.
 
 ## Why Codex Session Map?
 
