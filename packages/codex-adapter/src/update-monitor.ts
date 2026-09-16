@@ -1,5 +1,5 @@
 import { realpathSync, watch, type FSWatcher } from "node:fs";
-import { basename, dirname } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 export type SourceInvalidationReason = "source_change" | "periodic_reconciliation";
 export const DEFAULT_RECONCILIATION_INTERVAL_MS = 300_000;
@@ -26,7 +26,7 @@ export interface CodexUpdateMonitorOptions {
   readonly reconciliationIntervalMs?: number;
   /** Testable escape hatch: correctness must still come from reconciliation. */
   readonly disableFilesystemWatch?: boolean;
-  readonly onInvalidate: (reason: SourceInvalidationReason) => Promise<void> | void;
+  readonly onInvalidate: (reason: SourceInvalidationReason, paths?: readonly string[]) => Promise<void> | void;
   readonly onWatchError?: (error: Error) => void;
 }
 
@@ -42,6 +42,8 @@ export class CodexUpdateMonitor {
   #closed = false;
   #running = false;
   #pendingReason?: SourceInvalidationReason;
+  readonly #pendingPaths = new Set<string>();
+  #pendingUnknown = false;
 
   constructor(options: CodexUpdateMonitorOptions) {
     this.#options = options;
@@ -73,7 +75,8 @@ export class CodexUpdateMonitor {
       const exactName = exactFile ? basename(exactFile) : undefined;
       const watcher = watch(resolveWatchPath(directory), { recursive }, (_event, filename) => {
         if (exactName && filename && !String(filename).startsWith(exactName)) return;
-        this.#queue("source_change", this.#options.debounceMs ?? 350);
+        const changedPath = filename ? join(directory, String(filename)) : exactFile;
+        this.#queue("source_change", this.#options.debounceMs ?? 350, changedPath);
       });
       watcher.on("error", (error) => this.#options.onWatchError?.(error));
       this.#watchers.push(watcher);
@@ -82,9 +85,13 @@ export class CodexUpdateMonitor {
     }
   }
 
-  #queue(reason: SourceInvalidationReason, delay: number): void {
+  #queue(reason: SourceInvalidationReason, delay: number, changedPath?: string): void {
     if (this.#closed) return;
     this.#pendingReason = this.#pendingReason === "source_change" ? "source_change" : reason;
+    if (reason === "source_change") {
+      if (changedPath) this.#pendingPaths.add(changedPath);
+      else this.#pendingUnknown = true;
+    }
     if (this.#debounce) clearTimeout(this.#debounce);
     this.#debounce = setTimeout(() => void this.#flush(), delay);
     this.#debounce.unref();
@@ -97,10 +104,13 @@ export class CodexUpdateMonitor {
       return;
     }
     const reason = this.#pendingReason ?? "periodic_reconciliation";
+    const paths = this.#pendingUnknown ? undefined : [...this.#pendingPaths];
     this.#pendingReason = undefined;
+    this.#pendingPaths.clear();
+    this.#pendingUnknown = false;
     this.#running = true;
     try {
-      await this.#options.onInvalidate(reason);
+      await this.#options.onInvalidate(reason, paths?.length ? paths : undefined);
     } finally {
       this.#running = false;
       if (this.#pendingReason) this.#queue(this.#pendingReason, this.#options.debounceMs ?? 350);

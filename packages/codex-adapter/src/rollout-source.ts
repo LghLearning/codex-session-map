@@ -33,6 +33,26 @@ export interface DecodedRollout {
   readonly identityPrefixHash: string;
   readonly mode: "full" | "append";
   readonly partialTail: boolean;
+  /** Bytes read from disk for this decode (full file or append range). */
+  readonly bytesRead: number;
+}
+
+export interface RolloutRefreshStats {
+  readonly filesScanned: number;
+  readonly filesDecodedFull: number;
+  readonly filesDecodedAppend: number;
+  readonly bytesRead: number;
+  readonly affectedPaths: readonly string[];
+  readonly affectedSessionIds: readonly string[];
+  readonly refreshMs: number;
+}
+
+export interface RolloutRefreshResult {
+  readonly snapshot: SourceSnapshot;
+  readonly changed: boolean;
+  readonly affectedSessionIds: readonly string[];
+  readonly deletedSessionIds: readonly string[];
+  readonly stats: RolloutRefreshStats;
 }
 
 export interface RolloutSourceOptions {
@@ -51,10 +71,24 @@ interface Segment {
   readonly registryFileId: string;
 }
 
+interface FileState {
+  readonly path: string;
+  readonly archived: boolean;
+  readonly decoded: DecodedRollout;
+  readonly sessionIds: ReadonlySet<string>;
+  readonly registryFileId: string;
+  readonly size: number;
+  readonly mtimeMs: number;
+  readonly sourceStamp: string;
+  readonly contentStamp: string;
+}
+
 export class RolloutCodexSource {
   readonly #options: RolloutSourceOptions;
   readonly #segments = new Map<string, Segment[]>();
   readonly #registry?: RolloutSourceRegistry;
+  #files = new Map<string, FileState>();
+  #snapshot?: SourceSnapshot;
 
   constructor(options: RolloutSourceOptions) {
     this.#options = options;
@@ -62,49 +96,99 @@ export class RolloutCodexSource {
   }
 
   async list(): Promise<SourceSnapshot> {
-    this.#segments.clear();
-    const registryFiles = new Map<string, { path: string; archived: boolean; decoded: DecodedRollout; sessionIds: Set<string>; registryFileId: string }>();
+    return (await this.refresh()).snapshot;
+  }
+
+  /** Reconciles rollout files while reusing unchanged decoded files in memory. */
+  async refresh(changedPaths?: readonly string[]): Promise<RolloutRefreshResult> {
+    const started = Date.now();
+    const initial = !this.#snapshot;
     const roots = [
       { path: join(this.#options.codexHome, "sessions"), archived: false },
       { path: join(this.#options.codexHome, "archived_sessions"), archived: true },
     ];
-    for (const root of roots) {
-      for (const path of await walkJsonl(root.path)) {
-        const sourceKey = basename(path);
-        let decoded: DecodedRollout;
-        try {
-          decoded = await decodeRollout(path, undefined, this.#options.diagnostics);
-        } catch {
-          this.#options.diagnostics.add({ code: "corrupt_line", severity: "error", message: "A rollout could not be opened or decoded.", sourceKey });
+    const paths = (await Promise.all(roots.map((root) => walkJsonl(root.path)))).flat();
+    const current = new Map(paths.map((path) => [pathKey(path), { path, archived: pathKey(path).startsWith(pathKey(roots[1]!.path)) }]));
+    const hinted = new Set((changedPaths ?? []).map(pathKey));
+    const inspectAll = initial;
+    const files = new Map(this.#files);
+    const affectedPaths = new Set<string>();
+    const affectedSessions = new Set<string>();
+    let filesDecodedFull = 0;
+    let filesDecodedAppend = 0;
+    let bytesRead = 0;
+    for (const [key, entry] of current) {
+      const previous = files.get(key);
+      const inspect = inspectAll || changedPaths === undefined || hinted.has(key) || !previous;
+      if (!inspect && previous) continue;
+      const observed = await stat(entry.path).catch(() => undefined);
+      if (!observed) continue;
+      if (previous && !initial && !hinted.has(key) && observed.size === previous.size && observed.mtimeMs === previous.mtimeMs && changedPaths !== undefined) continue;
+      // A concrete watcher hint is authoritative enough to decode the file even
+      // when its size and timestamp have not changed (some filesystems have
+      // coarse timestamp resolution). Periodic scans may use the cheap probe.
+      if (previous && changedPaths === undefined && observed.size === previous.size && observed.mtimeMs === previous.mtimeMs && await probeUnchanged(entry.path, previous.decoded.checkpoint)) continue;
+      try {
+        const decoded = await decodeRollout(entry.path, previous?.decoded.checkpoint, this.#options.diagnostics);
+        bytesRead += decoded.bytesRead;
+        if (decoded.mode === "append" && previous) filesDecodedAppend += 1;
+        else filesDecodedFull += 1;
+        const combined = decoded.mode === "append" && previous
+          ? { ...decoded, records: [...previous.decoded.records, ...decoded.records], mode: "append" as const, partialTail: decoded.partialTail }
+          : decoded;
+        const ids = extractSessionIds(combined.records);
+        if (!ids.length) {
+          this.#options.diagnostics.add({ code: "orphan_rollout", severity: "warning", message: "A rollout has no usable session metadata id.", sourceKey: basename(entry.path) });
+          files.delete(key);
+          affectedPaths.add(entry.path);
+          if (previous) for (const sessionId of previous.sessionIds) affectedSessions.add(sessionId);
           continue;
         }
-        const metadata = decoded.records.filter((record) => record.value.type === "session_meta" && isRecord(record.value.payload));
-        const ids = [...new Set(metadata.map((record) => stringValue((record.value.payload as Record<string, unknown>).id)).filter((id): id is string => Boolean(id)))];
-        if (ids.length === 0) {
-          this.#options.diagnostics.add({ code: "orphan_rollout", severity: "warning", message: "A rollout has no usable session metadata id.", sourceKey });
-          continue;
+        if (ids.length > 1) this.#options.diagnostics.add({ code: "duplicate_metadata_id", severity: "warning", message: "A rollout contains repeated or conflicting session metadata.", sourceKey: basename(entry.path) });
+        const registryFileId = stableRolloutFileIdentity(ids, combined.identityPrefixHash);
+        const sourceStamp = digest(["rollout-source-v1", String(combined.checkpoint.observedEof), combined.checkpoint.headHash, combined.checkpoint.tailHash, combined.checkpoint.identityPrefixHash ?? ""]);
+        const contentStamp = decodedContentStamp(combined);
+        const contentChanged = !previous || previous.contentStamp !== contentStamp || previous.archived !== entry.archived;
+        files.set(key, { path: entry.path, archived: entry.archived, decoded: combined, sessionIds: new Set(ids), registryFileId, size: observed.size, mtimeMs: observed.mtimeMs, sourceStamp, contentStamp });
+        if (contentChanged) {
+          affectedPaths.add(entry.path);
+          for (const sessionId of ids) affectedSessions.add(sessionId);
+          if (previous) for (const sessionId of previous.sessionIds) affectedSessions.add(sessionId);
         }
-        if (ids.length > 1 || metadata.length > 1) {
-          this.#options.diagnostics.add({ code: "duplicate_metadata_id", severity: "warning", message: "A rollout contains repeated or conflicting session metadata.", sourceKey });
-        }
-        const registryFileId = stableRolloutFileIdentity(ids, decoded.identityPrefixHash);
-        registryFiles.set(path, { path, archived: root.archived, decoded, sessionIds: new Set(ids), registryFileId });
-        for (const sessionId of ids) {
-          const segments = this.#segments.get(sessionId) ?? [];
-          segments.push({ path, archived: root.archived, records: decoded.records, partial: decoded.partialTail, sessionId, segmentIdentity: stableSegmentIdentity(sessionId, decoded.identityPrefixHash), registryFileId });
-          this.#segments.set(sessionId, segments);
-        }
+      } catch {
+        this.#options.diagnostics.add({ code: "corrupt_line", severity: "error", message: "A rollout could not be opened or decoded.", sourceKey: basename(entry.path) });
       }
     }
-
-    const threads: CodexThreadRecord[] = [];
-    for (const [sessionId, segments] of this.#segments) {
-      segments.sort(compareSegments);
-      if (segments.length > 1) this.#options.diagnostics.add({ code: "multi_segment_session", severity: "info", message: `One logical session aggregates ${segments.length} rollout segments.`, sessionId });
-      threads.push(projectSegments(sessionId, segments));
+    for (const [key, previous] of this.#files) {
+      if (current.has(key)) continue;
+      files.delete(key);
+      affectedPaths.add(previous.path);
+      for (const sessionId of previous.sessionIds) affectedSessions.add(sessionId);
     }
-    await this.#registry?.reconcile(await registryInputs(registryFiles, this.#segments));
-    return { threads, projects: [] };
+    const segments = buildSegments(files);
+    const threads: CodexThreadRecord[] = [];
+    for (const [sessionId, sessionSegments] of segments) {
+      const ordered = sessionSegments.slice().sort(compareSegments);
+      if (ordered.length > 1) this.#options.diagnostics.add({ code: "multi_segment_session", severity: "info", message: `One logical session aggregates ${ordered.length} rollout segments.`, sessionId });
+      threads.push(projectSegments(sessionId, ordered));
+    }
+    const snapshot: SourceSnapshot = { threads, projects: [] };
+    const previousIds = new Set(this.#snapshot?.threads.map((thread) => thread.id) ?? []);
+    const nextIds = new Set(threads.map((thread) => thread.id));
+    const deletedSessionIds = [...previousIds].filter((id) => !nextIds.has(id));
+    const changed = initial || deletedSessionIds.length > 0 || affectedPaths.size > 0;
+    if (changed) await this.#registry?.reconcile(await registryInputs(files, segments));
+    this.#files = files;
+    this.#segments.clear();
+    for (const [sessionId, sessionSegments] of segments) this.#segments.set(sessionId, sessionSegments);
+    this.#snapshot = snapshot;
+    return {
+      snapshot,
+      changed,
+      affectedSessionIds: [...affectedSessions].filter((id) => nextIds.has(id)),
+      deletedSessionIds,
+      stats: { filesScanned: paths.length, filesDecodedFull, filesDecodedAppend, bytesRead, affectedPaths: [...affectedPaths], affectedSessionIds: [...affectedSessions], refreshMs: Date.now() - started },
+    };
   }
 
   async listTurns(sessionId: string, knownPaths: readonly string[] = []): Promise<readonly CodexTurnRecord[]> {
@@ -135,8 +219,56 @@ export class RolloutCodexSource {
   }
 }
 
+function buildSegments(files: ReadonlyMap<string, FileState>): Map<string, Segment[]> {
+  const segments = new Map<string, Segment[]>();
+  for (const file of files.values()) {
+    for (const sessionId of file.sessionIds) {
+      const values = segments.get(sessionId) ?? [];
+      values.push({
+        path: file.path,
+        archived: file.archived,
+        records: file.decoded.records,
+        partial: file.decoded.partialTail,
+        sessionId,
+        segmentIdentity: stableSegmentIdentity(sessionId, file.decoded.identityPrefixHash),
+        registryFileId: file.registryFileId,
+      });
+      segments.set(sessionId, values);
+    }
+  }
+  return segments;
+}
+
+function extractSessionIds(records: readonly DecodedRecord[]): string[] {
+  const metadata = records.filter((record) => record.value.type === "session_meta" && isRecord(record.value.payload));
+  return [...new Set(metadata.map((record) => stringValue((record.value.payload as Record<string, unknown>).id)).filter((id): id is string => Boolean(id)))];
+}
+
+function decodedContentStamp(decoded: DecodedRollout): string {
+  return digest(decoded.records.map((record) => `${record.ordinal}:${JSON.stringify(record.value)}`));
+}
+
+function pathKey(path: string): string {
+  const normalized = path.replaceAll("\\", "/");
+  return process.platform === "win32" ? normalized.toLocaleLowerCase("en-US") : normalized;
+}
+
+async function probeUnchanged(path: string, checkpoint: RolloutCheckpoint): Promise<boolean> {
+  try {
+    const handle = await open(path, "r");
+    try {
+      const size = (await handle.stat()).size;
+      if (size !== checkpoint.observedEof) return false;
+      const head = await readWindow(handle, 0, Math.min(PROBE_BYTES, size));
+      const tailOffset = Math.max(0, size - PROBE_BYTES);
+      const tail = await readWindow(handle, tailOffset, size - tailOffset);
+      return hash(head) === checkpoint.headHash && hash(tail) === checkpoint.tailHash;
+    } finally { await handle.close(); }
+  } catch { return false; }
+}
+
 async function registryInputs(
-  files: ReadonlyMap<string, { path: string; archived: boolean; decoded: DecodedRollout; sessionIds: Set<string>; registryFileId: string }>,
+  files: ReadonlyMap<string, FileState>,
   segmentsBySession: ReadonlyMap<string, readonly Segment[]>,
 ): Promise<RolloutRegistryFileInput[]> {
   const inputs: RolloutRegistryFileInput[] = [];
@@ -157,7 +289,7 @@ async function registryInputs(
       stableFileIdentity: file.registryFileId,
       size: checkpoint.observedEof,
       mtimeMs: fileStat?.mtimeMs ?? 0,
-      sourceStamp: digest(["rollout-source-v1", String(checkpoint.observedEof), checkpoint.headHash, checkpoint.tailHash, checkpoint.identityPrefixHash ?? ""]),
+      sourceStamp: file.sourceStamp,
       checkpoint,
       sessions: segments,
     });
@@ -225,6 +357,7 @@ export async function decodeRollout(path: string, checkpoint: RolloutCheckpoint 
         tailHash: hash(tail),
         identityPrefixHash,
       },
+      bytesRead: length + head.length + tail.length,
     };
   } finally {
     await handle.close();

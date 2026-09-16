@@ -24,6 +24,7 @@ test("filesystem hints are debounced and periodic reconciliation remains a fallb
   t.after(() => rm(root, { recursive: true, force: true }));
 
   const reasons: SourceInvalidationReason[] = [];
+  const paths: string[][] = [];
   const monitor = new CodexUpdateMonitor({
     sessionsDirectory: sessions,
     archivedSessionsDirectory: archived,
@@ -31,7 +32,7 @@ test("filesystem hints are debounced and periodic reconciliation remains a fallb
     historyDatabase: history,
     debounceMs: 20,
     reconciliationIntervalMs: 100,
-    onInvalidate: (reason) => { reasons.push(reason); },
+    onInvalidate: (reason, changedPaths) => { reasons.push(reason); if (changedPaths) paths.push([...changedPaths]); },
   });
   monitor.start();
   t.after(() => monitor.close());
@@ -40,6 +41,7 @@ test("filesystem hints are debounced and periodic reconciliation remains a fallb
   await waitFor(() => reasons.includes("source_change"), 2_000);
   await waitFor(() => reasons.includes("periodic_reconciliation"), 2_000);
   assert.ok(reasons.length >= 2);
+  assert.equal(paths.some((items) => items.some((item) => item.endsWith("rollout.jsonl"))), true);
 });
 
 test("periodic reconciliation restores correctness when watcher hints are unavailable", async (t) => {

@@ -52,6 +52,9 @@ export class CodexAdapterV1 implements SessionProvider, LiveSessionProvider {
   #appServer?: AppServerSource;
   #structured?: StructuredCodexSource;
   #rollout?: RolloutCodexSource;
+  #primarySnapshot: SourceSnapshot = { threads: [], projects: [] };
+  #structuredSnapshot: SourceSnapshot = { threads: [], projects: [] };
+  #rolloutSnapshot: SourceSnapshot = { threads: [], projects: [] };
   #turnIdentityAliases?: Promise<readonly TurnIdentityAlias[]>;
   #loadPromise?: Promise<void>;
   #monitor?: CodexUpdateMonitor;
@@ -152,6 +155,9 @@ export class CodexAdapterV1 implements SessionProvider, LiveSessionProvider {
       appServer: this.#appServer,
       structured: this.#structured,
       rollout: this.#rollout,
+      primarySnapshot: this.#primarySnapshot,
+      structuredSnapshot: this.#structuredSnapshot,
+      rolloutSnapshot: this.#rolloutSnapshot,
       turnIdentityAliases: this.#turnIdentityAliases,
       diagnostics: this.#diagnostics,
     };
@@ -168,6 +174,9 @@ export class CodexAdapterV1 implements SessionProvider, LiveSessionProvider {
       this.#appServer = previous.appServer;
       this.#structured = previous.structured;
       this.#rollout = previous.rollout;
+      this.#primarySnapshot = previous.primarySnapshot;
+      this.#structuredSnapshot = previous.structuredSnapshot;
+      this.#rolloutSnapshot = previous.rolloutSnapshot;
       this.#turnIdentityAliases = previous.turnIdentityAliases;
       this.#diagnostics = previous.diagnostics;
       throw error;
@@ -187,7 +196,7 @@ export class CodexAdapterV1 implements SessionProvider, LiveSessionProvider {
         debounceMs: this.#options.watchDebounceMs,
         reconciliationIntervalMs: this.#options.reconciliationIntervalMs,
         disableFilesystemWatch: this.#options.disableFilesystemWatch,
-        onInvalidate: (reason) => this.#handleInvalidation(reason),
+        onInvalidate: (reason, paths) => this.#handleInvalidation(reason, paths),
         onWatchError: (error) => this.#diagnostics.add({ code: "live_update_unavailable", severity: "warning", message: `A local source watcher failed; periodic reconciliation remains active (${error.name}).` }),
       });
       this.#monitor.start();
@@ -231,16 +240,45 @@ export class CodexAdapterV1 implements SessionProvider, LiveSessionProvider {
     }
 
     const [structured, reconciled] = await Promise.all([this.#structured.list(), this.#rollout.list()]);
+    this.#primarySnapshot = primary;
+    this.#structuredSnapshot = structured;
+    this.#rolloutSnapshot = reconciled;
     const records = mergeSnapshots([reconciled, structured, primary], this.#diagnostics);
     const projects = mergeProjects([...reconciled.projects, ...structured.projects, ...primary.projects]);
     this.#state = await materialize(records, projects, this.#diagnostics);
   }
 
-  async #handleInvalidation(reason: SourceInvalidationReason): Promise<void> {
+  async #handleInvalidation(reason: SourceInvalidationReason, paths?: readonly string[]): Promise<void> {
     try {
       const previous = this.#state;
-      await this.refresh();
-      const scope = previous && this.#state ? changedSessions(previous, this.#state) : undefined;
+      if (!previous) return;
+      const environment = await this.getEnvironment();
+      if (!this.#rollout || !this.#structured) return;
+      const result = await this.#rollout.refresh(paths);
+      this.#rolloutSnapshot = result.snapshot;
+      if (paths?.length && paths.some((path) => !isRolloutPath(path, environment.codexHome))) {
+        this.#structuredSnapshot = await this.#structured.list();
+        if (this.#appServer) {
+          try { this.#primarySnapshot = await this.#appServer.list(); }
+          catch (error) { this.#diagnostics.add({ code: "app_server_unavailable", severity: "warning", message: `App-server refresh failed; previous primary snapshot was retained (${errorName(error)}).` }); }
+        }
+      } else if (paths === undefined) {
+        this.#structuredSnapshot = await this.#structured.list();
+        if (this.#appServer) {
+          try { this.#primarySnapshot = await this.#appServer.list(); }
+          catch (error) { this.#diagnostics.add({ code: "app_server_unavailable", severity: "warning", message: `App-server refresh failed; previous primary snapshot was retained (${errorName(error)}).` }); }
+        }
+      }
+      const records = mergeSnapshots([this.#rolloutSnapshot, this.#structuredSnapshot, this.#primarySnapshot], this.#diagnostics);
+      const projects = mergeProjects([...this.#rolloutSnapshot.projects, ...this.#structuredSnapshot.projects, ...this.#primarySnapshot.projects]);
+      const next = await materialize(records, projects, this.#diagnostics);
+      const structural = changedSessions(previous, next);
+      const affected = new Set([...(structural?.affected ?? []), ...result.affectedSessionIds]);
+      const deleted = new Set([...(structural?.deleted ?? []), ...result.deletedSessionIds]);
+      const scope = affected.size || deleted.size ? { affected: [...affected], deleted: [...deleted] } : undefined;
+      if (!scope) return;
+      this.#state = next;
+      this.#turnIdentityAliases = undefined;
       const update: SessionProviderUpdate = {
         revision: ++this.#revision,
         reason,
@@ -267,6 +305,14 @@ function changedSessions(before: MaterializedState, after: MaterializedState): {
 
 function sourceStateFingerprint(session: Session, record?: CodexThreadRecord): string {
   return createHash("sha256").update(JSON.stringify({ session, record })).digest("hex");
+}
+
+function isRolloutPath(path: string, codexHome: string): boolean {
+  const normalize = (value: string) => value.replaceAll("\\", "/").replace(/\/+$/, "").toLocaleLowerCase("en-US");
+  const candidate = normalize(path);
+  const active = `${normalize(codexHome)}/sessions/`;
+  const archived = `${normalize(codexHome)}/archived_sessions/`;
+  return (candidate.startsWith(active) || candidate.startsWith(archived)) && candidate.endsWith(".jsonl");
 }
 
 function mergeSnapshots(snapshots: readonly SourceSnapshot[], diagnostics: DiagnosticCollector): Map<string, CodexThreadRecord> {
