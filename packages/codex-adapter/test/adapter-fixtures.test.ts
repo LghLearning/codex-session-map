@@ -192,6 +192,30 @@ test("adapter rebuilds a source registry from rollout metadata without storing d
   assert.equal(new RolloutSourceRegistry(registryPath).snapshot().length, first.length, "deleting the registry must be recoverable from Codex source");
 });
 
+test("countTurns uses registered metadata without rereading rollout bodies", async () => {
+  const home = await fixtureHome();
+  const registryPath = join(await mkdtemp(join(tmpdir(), "codex-map-counts-")), "source-registry.sqlite");
+  const directory = join(home, "sessions", "full-content");
+  await mkdir(directory, { recursive: true });
+  await writeFile(join(directory, "long.jsonl"), [
+    { type: "session_meta", payload: { id: "long-session", cwd: "C:\\Counts" } },
+    { type: "event_msg", payload: { type: "task_started", turn_id: "turn-one" } },
+    { type: "event_msg", payload: { type: "user_message", message: "one" } },
+    { type: "event_msg", payload: { type: "task_complete", turn_id: "turn-one", last_agent_message: "done" } },
+    { type: "event_msg", payload: { type: "task_started", turn_id: "turn-two" } },
+    { type: "event_msg", payload: { type: "user_message", message: "two" } },
+    { type: "event_msg", payload: { type: "task_complete", turn_id: "turn-two", last_agent_message: "done" } },
+    { type: "event_msg", payload: { type: "task_started", turn_id: "turn-three" } },
+    { type: "event_msg", payload: { type: "user_message", message: "three" } },
+    { type: "event_msg", payload: { type: "task_complete", turn_id: "turn-three", last_agent_message: "done" } },
+  ].map((event) => JSON.stringify(event)).join("\n") + "\n");
+  const adapter = new CodexAdapterV1({ codexHome: home, disableAppServer: true, sourceRegistryPath: registryPath });
+  await adapter.listWorkspaceScopes();
+
+  await rm(join(directory, "long.jsonl"));
+  assert.equal(await adapter.countTurns("long-session"), 3, "collapsed Forest counts remain available from Registry metadata");
+});
+
 test("hidden agent sessions remain enumerable in diagnostics mode", async () => {
   const adapter = new CodexAdapterV1({ codexHome: await fixtureHome(), disableAppServer: true, includeHidden: true });
   const scopes = await adapter.listWorkspaceScopes();
