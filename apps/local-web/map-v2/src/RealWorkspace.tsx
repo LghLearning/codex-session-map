@@ -12,6 +12,7 @@ import { resolveSearchNavigation } from "./search/navigation.ts";
 import { TurnReader } from "./reader/TurnReader.tsx";
 import { OrganizationControl } from "./organization/OrganizationControl.tsx";
 import { patchSessionTitle } from "./map-updates.ts";
+import { FirstUseNotice } from "./FirstUseNotice.tsx";
 
 const nodeTypes = { session: SessionNode, turn: TurnNode, section: SectionNode };
 const MAX_EXPANDED = 12;
@@ -33,6 +34,7 @@ export default function RealWorkspace() {
   const [viewport, setViewport] = useState<PersistedWorkspaceState["viewport"]>();
   const [showNative, setShowNative] = useState(false);
   const [railCollapsed, setRailCollapsed] = useState(false);
+  const [showGuide, setShowGuide] = useState(false);
   const [detail, setDetail] = useState<any>();
   const [detailError, setDetailError] = useState("");
   const [draft, setDraft] = useState<{ kind: "title" | "label"; value: string }>();
@@ -264,20 +266,23 @@ export default function RealWorkspace() {
       <select aria-label="Workspace" value={workspace} onChange={(event) => void switchWorkspace(event.target.value)}>{bootstrap?.scopes.map((scope) => <option key={scope.id} value={scope.id}>{scope.displayName}</option>)}</select>
       <SearchPanel query={search.query} setQuery={search.setQuery} results={search.page?.results ?? []} index={search.index} loading={search.loading} error={search.error} nextCursor={search.page?.nextCursor} loadMore={() => void search.loadMore()} onSelect={selectSearchResult} />
       <div className="view-tabs"><button className="active" type="button">Map</button><a href={legacyHref}>List</a></div>
-      <OrganizationControl workspace={workspace} available={Boolean(bootstrap?.organizer?.available)} selectedSessionId={selection?.sessionId} expandedSessionIds={[...expanded]} liveJob={organizationProgress} connectionRevision={eventConnectionRevision} onNotice={setNotice} onComplete={() => { void reloadForest(workspace); for (const sessionId of expandedRef.current) void reloadTurnDirectory(sessionId).catch(() => undefined); }} onProgress={(item) => { if (item?.operation === "trace") { if (expandedRef.current.has(item.sessionId)) void reloadTurnDirectory(item.sessionId).catch(() => undefined); } else if (item?.operation === "title") void reloadSessionTitle(item.sessionId).catch(() => undefined); else void reloadForest(workspace); }} />
+      <button type="button" className="subtle map-guide-button" onClick={() => setShowGuide(true)}>Map guide</button>
+      <OrganizationControl workspace={workspace} available={Boolean(bootstrap?.organizer?.available)} generationAvailable={Boolean(bootstrap?.semanticTraces?.generationAvailable)} selectedSessionId={selection?.sessionId} expandedSessionIds={[...expanded]} liveJob={organizationProgress} connectionRevision={eventConnectionRevision} onNotice={setNotice} onComplete={() => { void reloadForest(workspace); for (const sessionId of expandedRef.current) void reloadTurnDirectory(sessionId).catch(() => undefined); }} onProgress={(item) => { if (item?.operation === "trace") { if (expandedRef.current.has(item.sessionId)) void reloadTurnDirectory(item.sessionId).catch(() => undefined); } else if (item?.operation === "title") void reloadSessionTitle(item.sessionId).catch(() => undefined); else void reloadForest(workspace); }} />
       <button type="button" className="subtle" onClick={() => void performUndo()}>Undo</button>
     </header>
     <aside className="workspace-rail">
       <button type="button" className="rail-toggle" onClick={() => setRailCollapsed((value) => !value)}>{railCollapsed ? "›" : "‹"}</button>
       <h2>Workspace</h2><p>{forest?.stats.confirmedRoots ?? 0} roots · {forest?.stats.sessions ?? 0} Sessions</p>
-      <nav><button className="active" type="button">Work evolution</button><button type="button">Recent</button><button type="button">Unorganized <span>{forest?.stats.unorganized ?? 0}</span></button></nav>
+      <nav><button className="active" type="button">Work evolution</button><button type="button">Recent</button><button type="button">Not organized yet <span>{forest?.stats.unorganized ?? 0}</span></button></nav>
       <div className="rail-sessions">{sessions.slice(0, 12).map((session) => <button type="button" className={selection?.sessionId === session.sessionId ? "selected" : ""} key={session.sessionId} onClick={() => select({ kind: "session", sessionId: session.sessionId })}>{session.displayTitle}</button>)}</div>
-      <div className="legend"><h3>Relations</h3><p><i className="solid" /> User semantic</p><p><i className="dashed" /> AI semantic</p><p><i className="native" /> Native origin</p></div>
+      <div className="legend"><h3>Map connections</h3><p><i className="solid" /> Your placement</p><p><i className="dashed" /> AI suggestion</p><p><i className="native" /> Original branch source</p></div>
     </aside>
     <section className="map-stage" aria-label="Session–Turn Work Evolution Map">
-      <div className="map-toolbar"><div><strong>Work evolution</strong><span>{forest?.stats.confirmedRoots ?? 0} roots · {forest?.stats.sessions ?? 0} Sessions · {expanded.size} expanded</span></div><label><input type="checkbox" checked={showNative} onChange={(event) => setShowNative(event.target.checked)} /> Show native lineage</label><button type="button" onClick={() => void flow.fitView({ padding: .12, duration: 300 }).then(() => setViewport(flow.getViewport()))}>Fit view</button></div>
-      {loading && <div className="map-centered-state">Loading Workspace map…</div>}
-      {forestError && <div className="map-centered-state error"><strong>Unable to load map</strong><span>{forestError}</span><button type="button" onClick={() => void reloadForest(workspace)}>Retry</button></div>}
+      <div className="map-toolbar"><div><strong>Work evolution</strong><span>{forest?.stats.confirmedRoots ?? 0} roots · {forest?.stats.sessions ?? 0} Sessions · {expanded.size} expanded</span></div><label><input type="checkbox" checked={showNative} onChange={(event) => setShowNative(event.target.checked)} /> Show original branch source</label><button type="button" onClick={() => void flow.fitView({ padding: .12, duration: 300 }).then(() => setViewport(flow.getViewport()))}>Fit view</button></div>
+      {loading && <div className="map-centered-state"><strong>Preparing your local Codex history…</strong><span>Original Codex history is not modified.</span></div>}
+      <FirstUseNotice />
+      {showGuide && <FirstUseNotice forceVisible onDismiss={() => setShowGuide(false)} />}
+      {forestError && <div className="map-centered-state error"><strong>Could not load this Workspace map</strong><span>{forestError}</span><button type="button" onClick={() => void reloadForest(workspace)}>Retry</button></div>}
       {forest && <ReactFlow
         nodes={renderNodes} edges={graph.edges} nodeTypes={nodeTypes as any} minZoom={.22} maxZoom={1.8} defaultViewport={viewport ?? { x: 70, y: 72, zoom: .82 }}
         onNodesChange={onNodesChange} onNodeClick={onNodeClick} onConnect={onConnect} nodesConnectable nodesDraggable panOnDrag selectionOnDrag
@@ -297,9 +302,9 @@ export default function RealWorkspace() {
 function DetailDrawer(props: any) {
   const title = props.selection.kind === "turn" ? props.detail?.semanticTrace?.navigationLabel ?? props.turn?.displayLabel ?? `Turn ${props.selection.nativeTurnId}` : props.detail?.semanticTitle?.displayTitle ?? props.session?.displayTitle;
   const heading = props.selection.kind === "turn" && props.turn ? `T${props.turn.displayOrdinal} · ${title}` : title;
-  return <aside className="detail-drawer"><button type="button" className="drawer-close" aria-label="Close detail" onClick={props.close}>×</button><span className="drawer-kicker">{props.selection.kind} detail</span><h2>{heading ?? "Loading…"}</h2>
+  return <aside className="detail-drawer"><button type="button" className="drawer-close" aria-label="Close detail" onClick={props.close}>×</button><span className="drawer-kicker">{props.selection.kind === "turn" ? "Turn details" : "Session details"}</span><h2>{heading ?? "Loading…"}</h2>
     {props.error && props.selection.kind === "session" && <p className="drawer-error">{props.error} <button type="button" onClick={props.close}>Close</button></p>}
-    {props.selection.kind === "session" ? <><p>{props.detail?.semanticParent?.relation ? `${props.detail.semanticParent.relation} · ${props.detail.semanticParent.authority}` : "Unorganized"}</p><dl><dt>Turns</dt><dd>{props.session?.turnCount}</dd><dt>Original title</dt><dd>{props.detail?.semanticTitle?.originalTitle ?? props.session?.originalTitle}</dd><dt>Semantic anchor</dt><dd>{props.detail?.semanticParent?.anchorTurnId ?? "Session level"}</dd><dt>Native origin</dt><dd>{props.detail?.semanticParent?.nativeLineage?.originTurnId ?? "None"}</dd></dl></> : <TurnReader nativeTurnId={props.selection.nativeTurnId} directory={props.directory} detail={props.detail} error={props.error} onNavigate={props.onNavigateTurn} />}
+    {props.selection.kind === "session" ? <><p>{formatPlacement(props.detail?.semanticParent)}</p><dl><dt>Turns</dt><dd>{props.session?.turnCount}</dd><dt>Original title</dt><dd>{props.detail?.semanticTitle?.originalTitle ?? props.session?.originalTitle}</dd><dt>Related Turn</dt><dd>{props.detail?.semanticParent?.anchorTurnId ?? "Session level"}</dd><dt>Original branch source</dt><dd>{props.detail?.semanticParent?.nativeLineage?.originTurnId ?? "None"}</dd></dl></> : <TurnReader nativeTurnId={props.selection.nativeTurnId} directory={props.directory} detail={props.detail} error={props.error} onNavigate={props.onNavigateTurn} />}
     {props.draft ? <div className="drawer-edit"><textarea autoFocus value={props.draft.value} onChange={(event) => props.setDraft({ ...props.draft, value: event.target.value })} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void props.saveDraft(); } }} /><button type="button" onClick={props.saveDraft}>Save</button><button type="button" onClick={() => props.setDraft(undefined)}>Cancel</button></div> : <div className="drawer-actions">
       <button type="button" onClick={() => props.setDraft({ kind: props.selection.kind === "turn" ? "label" : "title", value: title ?? "" })}>{props.selection.kind === "turn" ? "Edit label" : "Rename"}</button>
       {props.selection.kind === "session" && <><button type="button" onClick={props.beginMove}>Move</button><button type="button" onClick={() => props.setRoot(props.selection.sessionId)}>Set root</button></>}
@@ -309,11 +314,18 @@ function DetailDrawer(props: any) {
   </aside>;
 }
 
+function formatPlacement(parent?: { relation?: Relation; authority?: string }): string {
+  if (!parent?.relation) return "Not organized yet";
+  const source = parent.authority === "user" ? "User placement" : parent.authority === "ai" ? "AI suggestion" : "Placement";
+  const relation = parent.relation === "root" ? "Root Session" : parent.relation;
+  return `${relation} · ${source}`;
+}
+
 function PlacementPanel(props: any) {
   const sessions = props.forest ? flattenSessions([...props.forest.roots, ...props.forest.unorganized]).filter((item: SessionNodeData) => item.sessionId !== props.draft.childSessionId && (!props.draft.legalParentIds || props.draft.legalParentIds.includes(item.sessionId))) : [];
   const directory = props.turns.get(props.draft.parentSessionId) ?? [];
   useEffect(() => { if (props.draft.parentSessionId && !props.turns.has(props.draft.parentSessionId)) void props.loadTurns(props.draft.parentSessionId); }, [props.draft.parentSessionId]);
-  return <div className="placement-popover" role="dialog" aria-label="Move Session"><strong>Move Session</strong><label>Parent Session<select value={props.draft.parentSessionId} onChange={(event) => props.setDraft({ ...props.draft, parentSessionId: event.target.value, anchorTurnId: undefined })}><option value="">Choose parent…</option>{sessions.map((session: SessionNodeData) => <option key={session.sessionId} value={session.sessionId}>{session.displayTitle}</option>)}</select></label><label>Optional anchor Turn<select value={props.draft.anchorTurnId ?? ""} onChange={(event) => props.setDraft({ ...props.draft, anchorTurnId: event.target.value || undefined })}><option value="">Session level</option>{directory.map((turn: TurnDirectoryItem) => <option key={turn.nativeTurnId} value={turn.nativeTurnId}>T{turn.displayOrdinal} {turn.displayLabel}</option>)}</select></label><label>Relation<select value={props.draft.relation} onChange={(event) => props.setDraft({ ...props.draft, relation: event.target.value as Relation })}><option value="continuation">continuation</option><option value="subtask">subtask</option></select></label><p>Move under {props.draft.parentSessionId || "…"}{props.draft.anchorTurnId ? ` / ${props.draft.anchorTurnId}` : " at Session level"}</p><div><button type="button" disabled={!props.draft.parentSessionId} onClick={props.confirm}>Confirm</button><button type="button" onClick={props.cancel}>Cancel</button></div></div>;
+  return <div className="placement-popover" role="dialog" aria-label="Move Session"><strong>Move Session</strong><label>Place under Session<select value={props.draft.parentSessionId} onChange={(event) => props.setDraft({ ...props.draft, parentSessionId: event.target.value, anchorTurnId: undefined })}><option value="">Choose parent…</option>{sessions.map((session: SessionNodeData) => <option key={session.sessionId} value={session.sessionId}>{session.displayTitle}</option>)}</select></label><label>Related Turn (optional)<select value={props.draft.anchorTurnId ?? ""} onChange={(event) => props.setDraft({ ...props.draft, anchorTurnId: event.target.value || undefined })}><option value="">Session level (no specific Turn)</option>{directory.map((turn: TurnDirectoryItem) => <option key={turn.nativeTurnId} value={turn.nativeTurnId}>T{turn.displayOrdinal} {turn.displayLabel}</option>)}</select></label><label>Relationship<select value={props.draft.relation} onChange={(event) => props.setDraft({ ...props.draft, relation: event.target.value as Relation })}><option value="continuation">continuation</option><option value="subtask">subtask</option></select></label><p>Place under {props.draft.parentSessionId || "…"}{props.draft.anchorTurnId ? ` / ${props.draft.anchorTurnId}` : " at Session level"}</p><div><button type="button" disabled={!props.draft.parentSessionId} onClick={props.confirm}>Confirm</button><button type="button" onClick={props.cancel}>Cancel</button></div></div>;
 }
 
 function limitedExpansion(current: ReadonlySet<string>, sessionId: string): Set<string> {

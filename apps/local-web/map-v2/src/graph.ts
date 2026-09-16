@@ -39,7 +39,7 @@ export function buildMapGraph(options: MapGraphOptions): MapGraph {
     cursorY += measureTree(root, options) + TREE_GAP;
   }
   if (options.forest.unorganized.length) {
-    nodes.push({ id: "section:unorganized", type: "section", position: { x: 40, y: cursorY }, data: { kind: "section", label: "Unorganized" }, draggable: false, selectable: false });
+    nodes.push({ id: "section:unorganized", type: "section", position: { x: 40, y: cursorY }, data: { kind: "section", label: "Not organized yet" }, draggable: false, selectable: false });
     cursorY += 48;
     for (const session of options.forest.unorganized) {
       placeTree(session, 40, cursorY, options, nodes, edges);
@@ -59,7 +59,7 @@ export function buildMapGraph(options: MapGraphOptions): MapGraph {
       targetHandle: "branch-in",
       type: "smoothstep",
       className: `semantic-edge ${session.placementSource}`,
-      label: session.semanticAnchorTurnId && !anchorExists ? "anchor hidden" : session.semanticRelation,
+      label: session.semanticAnchorTurnId && !anchorExists ? "Related Turn not loaded" : session.semanticRelation,
       animated: false,
     });
   }
@@ -71,7 +71,7 @@ export function buildMapGraph(options: MapGraphOptions): MapGraph {
     edges.push({
       id: `native:${session.sessionId}`,
       source: exact ? turnNodeId(native.parentSessionId, native.originTurnId!) : sessionNodeId(native.parentSessionId),
-      sourceHandle: "branch-out", target: sessionNodeId(session.sessionId), targetHandle: "branch-in", type: "smoothstep", className: "native-edge", label: "Native origin",
+      sourceHandle: "branch-out", target: sessionNodeId(session.sessionId), targetHandle: "branch-in", type: "smoothstep", className: "native-edge", label: "Original branch source",
     });
   }
   const width = nodes.reduce((max, node) => Math.max(max, node.position.x + (node.type === "turn" ? 236 : SESSION_WIDTH)), 0) + 80;

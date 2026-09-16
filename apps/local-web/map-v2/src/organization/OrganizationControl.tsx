@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { controlOrganization, getLatestOrganization, getOrganization, getOrganizationItems, startOrganization, type OrganizationItemView, type OrganizationJobView, type OrganizationMode } from "../api.ts";
 import { acceptsOrganizationProgress, ORGANIZATION_POLL_FALLBACK_MS } from "./progress.ts";
+import { organizationStatusCopy } from "../clarity.ts";
 
 const ACTIVE = new Set(["queued", "running", "pausing", "canceling"]);
 
 export function OrganizationControl(props: {
   workspace: string;
   available: boolean;
+  generationAvailable: boolean;
   selectedSessionId?: string;
   expandedSessionIds: readonly string[];
   onProgress(item?: OrganizationJobView["lastCommitted"]): void;
@@ -71,25 +73,27 @@ export function OrganizationControl(props: {
   }
 
   const active = Boolean(job && ACTIVE.has(job.status));
+  const canOrganize = props.available && props.generationAvailable;
   return <div className="organization-control">
-    <button type="button" className="subtle" disabled={!props.available} title={props.available ? "Organize this Workspace" : "AI organization unavailable"} onClick={() => setOpen((value) => !value)}>{active ? "Organizing…" : "Organize"}</button>
+    <button type="button" className="subtle" disabled={!canOrganize} title={canOrganize ? "Build or refresh this Workspace map" : "AI organization unavailable; Map, search, reader, and manual editing still work"} onClick={() => setOpen((value) => !value)}>{active ? "Organizing…" : "Organize"}</button>
+    {!canOrganize && <small className="organization-unavailable">AI unavailable · Map, search, reader, and manual editing still work</small>}
     {open && <section className="organization-panel" aria-label="Organization status">
-      <header><strong>{job ? `${job.mode === "quick" ? "Quick" : "Full"} Organization` : "Organize Workspace"}</strong><button type="button" aria-label="Close" onClick={() => setOpen(false)}>×</button></header>
-      {!job && <><p>Quick builds the Session map. Full also updates Turn labels.</p><div className="organization-actions"><button type="button" onClick={() => void start("quick")}>Quick</button><button type="button" onClick={() => void start("full")}>Full</button></div>{props.selectedSessionId && <div className="organization-actions"><button type="button" onClick={() => void start("quick", true)}>Quick this Session</button><button type="button" onClick={() => void start("full", true)}>Full this Session</button></div>}</>}
+      <header><strong>{job ? `${job.mode === "quick" ? "Build Session map" : "Build map + Turn summaries"}` : "Organize Workspace"}</strong><button type="button" aria-label="Close" onClick={() => setOpen(false)}>×</button></header>
+      {!job && <><p>Build Session map arranges Sessions and relationships. Build map + Turn summaries also updates navigation labels.</p><div className="organization-actions"><button type="button" onClick={() => void start("quick")}>Build Session map</button><button type="button" onClick={() => void start("full")}>Build map + Turn summaries</button></div>{props.selectedSessionId && <div className="organization-actions"><button type="button" onClick={() => void start("quick", true)}>Build this Session map</button><button type="button" onClick={() => void start("full", true)}>Build this Session + summaries</button></div>}</>}
       {job && <>
-        <p className={`organization-state ${job.status}`}>{label(job.status)}</p>
+        <p className={`organization-state ${job.status}`}>{organizationStatusCopy(job.status)}</p>
         <Operation label="Traces" value={job.counts.byOperation.trace} hidden={job.mode === "quick"} />
         <Operation label="Titles" value={job.counts.byOperation.title} />
         <Operation label="Relationships" value={job.counts.byOperation.parent} />
-        <p className="organization-summary">{job.counts.reused} reused · {job.counts.failed + job.counts.stale} failed/stale</p>
+        <p className="organization-summary">{job.counts.generated} generated · {job.counts.reused} reused · {job.counts.failed + job.counts.stale} failed or stale. The Map remains usable while this runs.</p>
         {job.error && <p className="organization-error">{job.error}</p>}
         <div className="organization-actions">
           {(job.status === "running" || job.status === "queued") && <button type="button" onClick={() => void control("pause")}>Pause</button>}
           {(job.status === "paused" || job.status === "interrupted") && <button type="button" onClick={() => void control("resume")}>Continue</button>}
           {ACTIVE.has(job.status) || job.status === "paused" || job.status === "interrupted" ? <button type="button" onClick={() => void control("cancel")}>Cancel</button> : null}
           {(job.status === "completed_with_failures" || job.status === "failed" || job.status === "canceled") && <button type="button" onClick={() => void control("retry")}>Retry failed</button>}
-          {(job.counts.failed > 0 || job.counts.stale > 0) && <button type="button" onClick={() => void getOrganizationItems(job.id).then((items) => setFailures(items.filter((item) => item.status === "failed" || item.status === "stale")))}>View failures</button>}
-          {!active && <button type="button" onClick={() => { setJob(undefined); }}>New organization</button>}
+          {(job.counts.failed > 0 || job.counts.stale > 0) && <button type="button" onClick={() => void getOrganizationItems(job.id).then((items) => setFailures(items.filter((item) => item.status === "failed" || item.status === "stale")))}>Review failed items</button>}
+          {!active && <button type="button" onClick={() => { setJob(undefined); }}>Start another run</button>}
         </div>
         {props.selectedSessionId && !active && <button className="organization-session" type="button" onClick={() => void start(job.mode, true)}>Organize selected Session</button>}
         {!active && <button className="organization-session" type="button" onClick={() => void start(job.mode, false, true)}>Update stale content</button>}
@@ -102,8 +106,4 @@ export function OrganizationControl(props: {
 function Operation(props: { label: string; value: OrganizationJobView["counts"]["byOperation"]["trace"]; hidden?: boolean }) {
   if (props.hidden) return null;
   return <div className="organization-operation"><span>{props.label}</span><strong>{props.value.completed} / {props.value.planned}</strong><progress max={Math.max(1, props.value.planned)} value={props.value.completed} /></div>;
-}
-
-function label(status: OrganizationJobView["status"]): string {
-  return ({ queued: "Queued", running: "Running", pausing: "Pausing after current item", paused: "Paused", canceling: "Canceling", canceled: "Canceled", completed: "Complete", completed_with_failures: "Completed with failures", interrupted: "Interrupted — continue when ready", failed: "Failed" })[status];
 }

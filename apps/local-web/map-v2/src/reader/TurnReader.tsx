@@ -12,8 +12,8 @@ export function TurnReader(props: {
   const detail = props.detail;
   return <div className="turn-reader">
     <nav className="reader-neighbors" aria-label="Neighboring Turns"><button type="button" disabled={!previous} onClick={() => previous && props.onNavigate(previous)}>← Previous Turn</button><button type="button" disabled={!next} onClick={() => next && props.onNavigate(next)}>Next Turn →</button></nav>
-    {props.error && <p className="drawer-error">Exact Turn read failed: {props.error}</p>}
-    {!detail && !props.error && <p className="reader-loading">Loading exact Turn content…</p>}
+    {props.error && <p className="drawer-error">Could not load this Turn. {props.error}</p>}
+    {!detail && !props.error && <p className="reader-loading">Loading the full Turn…</p>}
     {detail?.semanticTrace?.displayText && <section className="reader-summary"><h3>Summary</h3><p>{detail.semanticTrace.displayText}</p></section>}
     {detail && <>
       <section className="reader-section"><h3>User Input</h3><div className="markdown-body"><MarkdownContent value={detail.input} /></div></section>

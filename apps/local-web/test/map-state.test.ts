@@ -4,6 +4,7 @@ import { connectionToPlacement } from "../map-v2/src/placement.ts";
 import { prototypeForest, prototypeTurns } from "../map-v2/src/fixture.ts";
 import { buildMapGraph, sessionNodeId, turnNodeId } from "../map-v2/src/graph.ts";
 import { RequestSequence, preserveInteractionState, readLastWorkspace, readWorkspaceState, resolveRestoredSelection, saveLastWorkspace, saveWorkspaceState, selectionFromUrl, updateMapUrl } from "../map-v2/src/workspace-state.ts";
+import { dismissMapGuide, organizationStatusCopy, searchIndexCopy, shouldShowMapGuide, userFacingApiError } from "../map-v2/src/clarity.ts";
 
 test("URL selection takes precedence and round-trips workspace, Session and native Turn identity", () => {
   const url = new URL("http://local/map-v2?workspace=w&session=s&turn=native%2F3&view=map");
@@ -41,4 +42,15 @@ test("node drag changes positions only, while relationship targets map to Sessio
   assert.deepEqual(connectionToPlacement({ source: sessionNodeId("b"), sourceHandle: "reparent", target: sessionNodeId("a"), targetHandle: "branch-in" }, graph.nodes), { childSessionId: "b", parentSessionId: "a", relation: "subtask", anchorTurnId: undefined });
   assert.deepEqual(connectionToPlacement({ source: sessionNodeId("b"), sourceHandle: "reparent", target: turnNodeId("a", "a/native-3"), targetHandle: "relation-target" }, graph.nodes), { childSessionId: "b", parentSessionId: "a", relation: "subtask", anchorTurnId: "a/native-3" });
   assert.throws(() => connectionToPlacement({ source: sessionNodeId("a"), sourceHandle: "reparent", target: turnNodeId("a", "a/native-3"), targetHandle: "relation-target" }, graph.nodes), /cannot parent itself/);
+});
+
+test("product clarity keeps first-use guidance dismissible and maps technical states to actions", () => {
+  const values = new Map<string, string>();
+  const storage = { getItem: (key: string) => values.get(key) ?? null, setItem: (key: string, value: string) => void values.set(key, value) };
+  assert.equal(shouldShowMapGuide(storage), true);
+  dismissMapGuide(storage);
+  assert.equal(shouldShowMapGuide(storage), false);
+  assert.equal(userFacingApiError(409, "revision_conflict"), "This item changed elsewhere. Refresh and try again.");
+  assert.equal(searchIndexCopy({ state: "indexing", totalSessions: 4, indexedSessions: 2, indexedTurns: 8, coverage: .5 }).label, "Preparing local search…");
+  assert.match(organizationStatusCopy("interrupted"), /Continue/);
 });

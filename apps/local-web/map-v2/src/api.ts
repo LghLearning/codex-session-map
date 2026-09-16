@@ -1,4 +1,5 @@
 import type { MapForest, Relation, SearchIndexStatus, SearchPage, TurnDirectoryItem } from "./types.ts";
+import { userFacingApiError } from "./clarity.ts";
 
 export interface Bootstrap {
   scopes: { id: string; displayName: string }[];
@@ -94,6 +95,6 @@ export async function getOrganizationItems(jobId: string): Promise<OrganizationI
 async function api(path: string, options: RequestInit = {}): Promise<any> {
   const response = await fetch(path, { ...options, headers: { Accept: "application/json", ...(options.headers ?? {}) } });
   const value = await response.json();
-  if (!response.ok) throw new Error(value.error?.message ?? `Request failed (${response.status})`);
+  if (!response.ok) throw new Error(userFacingApiError(response.status, value.error?.message));
   return value;
 }
