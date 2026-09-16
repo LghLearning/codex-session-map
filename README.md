@@ -11,7 +11,7 @@ Turn Semantic Traces
 
 Codex history remains read-only. AI metadata and user corrections are stored locally in a separate application database.
 
-![Codex Session Map v0.1.0-alpha](docs/assets/session-forest-alpha.png)
+![Codex Session Map v0.2.0-beta.1](docs/assets/session-forest-alpha.png)
 
 ## What it does
 
@@ -29,7 +29,7 @@ Native Lineage records how Codex Sessions were created. Semantic placement recor
 
 ## Requirements
 
-- Windows 10/11 for the verified alpha path. Linux/macOS watcher behavior is not yet verified.
+- Windows for the verified beta path. Linux/macOS watcher behavior is not yet verified.
 - Node.js 24 or newer.
 - A local Codex installation with existing Session history.
 - Optional for AI generation: [Ollama](https://ollama.com/) and `qwen3.5`.
@@ -148,7 +148,6 @@ Filesystem watchers reduce update latency. Periodic reconciliation remains the c
 
 ## Known limitations
 
-- The package version remains `v0.1.0-alpha` while the unreleased v0.2 work is hardened; no beta tag or release is implied by the feature set.
 - Codex currently reports `openSession=false` and `openTurn=false`; the companion transcript and Copy Session ID are the supported fallback.
 - Semantic Parent inference can fail closed when the model returns a Session outside the candidate set. Rerunning retries only missing records.
 - Reparenting uses a dialog rather than drag-and-drop.

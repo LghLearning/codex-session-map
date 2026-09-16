@@ -29,7 +29,7 @@ import { createLocalWebServer, type LocalWebEnvironment, type LocalWebForest, ty
 import { WorkspaceSearchIndex } from "./search-index.ts";
 import { migrateTurnIdentityStores } from "./turn-identity-migration.ts";
 
-const PRODUCT_VERSION = "0.1.0-alpha";
+const PRODUCT_VERSION = "0.2.0-beta.1";
 let semanticUnavailableReason: string | undefined;
 
 const args = process.argv.slice(2);
