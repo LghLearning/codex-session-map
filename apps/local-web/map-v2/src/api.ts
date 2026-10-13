@@ -41,11 +41,11 @@ export async function getTurnDirectory(sessionId: string, signal?: AbortSignal):
 }
 export async function getSessionDetail(sessionId: string, signal?: AbortSignal): Promise<any> {
   const encoded = encodeURIComponent(sessionId);
-  const [session, title, parent, override] = await Promise.all([
+  const [session, title, parent] = await Promise.all([
     api(`/api/sessions/${encoded}`, { signal }), api(`/api/sessions/${encoded}/semantic-title`, { signal }),
-    api(`/api/sessions/${encoded}/semantic-parent`, { signal }), api(`/api/sessions/${encoded}/user-overrides/parent`, { signal }),
+    api(`/api/sessions/${encoded}/semantic-parent`, { signal }),
   ]);
-  return { session: session.session, semanticTitle: title.semanticTitle, semanticParent: parent.semanticParent, parentOverride: override.override };
+  return { session: session.session, semanticTitle: title.semanticTitle, semanticParent: parent.semanticParent };
 }
 export async function getSessionTitle(sessionId: string, signal?: AbortSignal): Promise<any> {
   return (await api(`/api/sessions/${encodeURIComponent(sessionId)}/semantic-title`, { signal })).semanticTitle;

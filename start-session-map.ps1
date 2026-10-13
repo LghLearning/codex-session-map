@@ -7,15 +7,42 @@ param(
 
 $ErrorActionPreference = "Stop"
 $projectRoot = $PSScriptRoot
-$nodeCommand = if ($NodePath) { Get-Item -LiteralPath $NodePath -ErrorAction SilentlyContinue } else { Get-Command node -ErrorAction SilentlyContinue }
-if (-not $nodeCommand) {
-  Write-Error "Codex Session Map requires Node >= 24. Node was not found on PATH."
+$nodeCandidates = if ($NodePath) {
+  @($NodePath)
+} else {
+  @(
+    Get-Command node -All -ErrorAction SilentlyContinue |
+      Where-Object { $_.CommandType -eq "Application" } |
+      ForEach-Object { $_.Source }
+  ) + @(
+    (Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe"),
+    (Join-Path $env:ProgramFiles "nodejs\node.exe"),
+    (Join-Path $env:LOCALAPPDATA "Programs\nodejs\node.exe")
+  )
+}
+
+$nodeExecutable = $null
+$detectedVersions = @()
+foreach ($candidate in ($nodeCandidates | Select-Object -Unique)) {
+  if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+  $version = & $candidate --version 2>$null
+  if ($LASTEXITCODE -ne 0) { continue }
+  if ($version -match '^v?(\d+)\.') { $major = [int]$Matches[1] } else { continue }
+  $detectedVersions += "$version ($candidate)"
+  if ($major -ge 24) { $nodeExecutable = $candidate; break }
+}
+if (-not $nodeExecutable) {
+  $found = if ($detectedVersions.Count) { $detectedVersions -join ", " } else { "none" }
+  Write-Error "Codex Session Map requires Node >= 24. Found: $found. Install Node 24 or pass -NodePath C:\path\to\node.exe."
   exit 1
 }
 
-$nodeExecutable = if ($nodeCommand.Source) { $nodeCommand.Source } else { $nodeCommand.FullName }
+Write-Host "Using Node $version from $nodeExecutable"
 & $nodeExecutable (Join-Path $projectRoot "scripts\check-node-version.mjs")
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+# The same Node executable must also run pnpm's build when -NodePath is used.
+$env:PATH = "$(Split-Path -Parent $nodeExecutable);$env:PATH"
 
 $pnpmCommand = Get-Command pnpm -ErrorAction SilentlyContinue
 if (-not $pnpmCommand) { throw "Codex Session Map requires pnpm to build the Map Workspace." }

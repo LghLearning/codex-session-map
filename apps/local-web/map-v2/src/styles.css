@@ -38,3 +38,17 @@ button, a, select { color: inherit; }
 .placement-popover { position: absolute; z-index: 40; top: 84px; left: 50%; width: min(430px, calc(100vw - 40px)); padding: 18px; transform: translateX(-50%); border: 1px solid #b8c9bd; border-radius: 14px; background: #fff; box-shadow: 0 20px 70px rgb(23 51 38 / 22%); }.placement-popover > strong { font-size: 14px; }.placement-popover label { margin-top: 12px; display: grid; gap: 5px; color: #617168; font-size: 9px; }.placement-popover select { width: 100%; padding: 8px; border: 1px solid #c9d5cc; border-radius: 7px; background: #fff; }.placement-popover p { color: #526359; font-size: 9px; overflow-wrap: anywhere; }.placement-popover > div { display: flex; gap: 7px; justify-content: flex-end; }.placement-popover button { padding: 7px 10px; border: 1px solid #bdccc1; border-radius: 7px; background: #fff; cursor: pointer; }.placement-popover button:first-child { color: #fff; background: #2d704b; }
 .first-use-notice { position: absolute; z-index: 10; top: 74px; left: 16px; width: min(380px, calc(100% - 32px)); padding: 13px 15px; border: 1px solid #a9c9b1; border-radius: 12px; background: rgb(249 253 249 / 97%); box-shadow: 0 12px 32px rgb(35 73 49 / 13%); color: #294936; }.first-use-notice strong { font-size: 12px; }.first-use-notice p { margin: 7px 0 0; color: #53685a; font-size: 10px; line-height: 1.45; }.first-use-notice button { margin-top: 10px; padding: 5px 9px; border: 1px solid #9abd9f; border-radius: 7px; background: #fff; color: #286344; cursor: pointer; }.react-flow__controls { border: 1px solid #ccd7ce; border-radius: 9px; overflow: hidden; box-shadow: none; }.react-flow__minimap { border: 1px solid #ccd7ce; border-radius: 10px; background: #f8faf7 !important; }
 @media (max-width: 1279px) { .map-shell { grid-template-columns: 54px minmax(0, 1fr); }.workspace-rail { padding-inline: 0; }.workspace-rail > :not(.rail-toggle) { display: none; }.rail-toggle { right: 14px; }.detail-drawer { top: 72px; right: 10px; bottom: 10px; }.map-topbar { grid-template-columns: 170px minmax(130px, 210px) minmax(150px, 1fr) auto auto auto auto; gap: 8px; padding-inline: 12px; } }
+
+/* Keep labels readable at the normal map zoom; zoomed-out views retain the overview. */
+.map-session-node > strong { font-size: 14px; }
+.map-turn-node > strong, .rail-sessions button { font-size: 12px; }
+.map-session-node > p, .relation-mark, .map-turn-node > span, .map-toolbar span,
+.map-notice, .react-flow__edge-text, .turn-load-state { font-size: 11px; }
+.legend, .legend h3, .first-use-notice p, .placement-popover label,
+.placement-popover p, .detail-drawer dl, .detail-drawer > p { font-size: 12px; }
+.rail-empty { color: #65756b; font-size: 12px; line-height: 1.5; }
+.placement-reason { padding: 10px 12px; border-radius: 8px; background: #edf5ef; overflow-wrap: anywhere; }
+.drawer-copy-actions { display: flex; flex-wrap: wrap; gap: 7px; margin: 0 0 16px; }
+.drawer-copy-actions button { padding: 8px 12px; border: 1px solid #a9c3b1; border-radius: 8px; background: #f5faf6; color: #245f3d; cursor: pointer; }
+.drawer-copy-actions button:disabled { opacity: .5; cursor: default; }
+.map-zoom-hint { position: absolute; z-index: 7; top: 76px; left: 50%; transform: translateX(-50%); max-width: calc(100% - 32px); padding: 7px 11px; border: 1px solid #c9d8cc; border-radius: 8px; background: rgb(255 255 255 / 94%); color: #526b59; font-size: 12px; text-align: center; pointer-events: none; }

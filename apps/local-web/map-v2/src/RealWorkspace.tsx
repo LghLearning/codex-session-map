@@ -16,6 +16,8 @@ import { FirstUseNotice } from "./FirstUseNotice.tsx";
 
 const nodeTypes = { session: SessionNode, turn: TurnNode, section: SectionNode };
 const MAX_EXPANDED = 12;
+const DETAIL_ZOOM = .6;
+type RailView = "work" | "recent" | "unorganized";
 
 export default function RealWorkspace() {
   const flow = useReactFlow();
@@ -32,8 +34,10 @@ export default function RealWorkspace() {
   const [selection, setSelection] = useState<Selection>();
   const [positions, setPositions] = useState<PersistedWorkspaceState["positions"]>({});
   const [viewport, setViewport] = useState<PersistedWorkspaceState["viewport"]>();
+  const [overview, setOverview] = useState(false);
   const [showNative, setShowNative] = useState(false);
   const [railCollapsed, setRailCollapsed] = useState(false);
+  const [railView, setRailView] = useState<RailView>("work");
   const [showGuide, setShowGuide] = useState(false);
   const [detail, setDetail] = useState<any>();
   const [detailError, setDetailError] = useState("");
@@ -81,12 +85,14 @@ export default function RealWorkspace() {
         const requested = url.searchParams.get("workspace");
         const preferred = readLastWorkspace(localStorage);
         const selectedWorkspace = boot.scopes.some((scope) => scope.id === requested) ? requested! : boot.scopes.some((scope) => scope.id === preferred) ? preferred! : boot.scopes[0]?.id ?? "";
-        if (!selectedWorkspace) throw new Error("No Codex Workspace is available.");
+        if (!selectedWorkspace) throw new Error("No local Codex history found. Start a Codex Session, then reload this page. If your history uses a custom CODEX_HOME, launch the map with that environment variable set.");
         const saved = readWorkspaceState(localStorage, selectedWorkspace);
-        fitUnseenWorkspace.current = !saved.viewport;
-        setWorkspace(selectedWorkspace); setExpanded(new Set(saved.expandedSessionIds)); setPositions(saved.positions);
-        setViewport(saved.viewport); setShowNative(Boolean(saved.showNative)); setRailCollapsed(Boolean(saved.railCollapsed));
         const restored = resolveRestoredSelection(url, saved.selection); setSelection(restored);
+        fitUnseenWorkspace.current = !saved.viewport && restored?.kind !== "turn";
+        setWorkspace(selectedWorkspace); setExpanded(new Set(saved.expandedSessionIds)); setPositions(saved.positions);
+        setViewport(viewportForSelection(saved.viewport, restored)); setShowNative(Boolean(saved.showNative)); setRailCollapsed(Boolean(saved.railCollapsed));
+        setOverview(restored?.kind === "turn" ? false : saved.overview ?? (saved.viewport?.zoom ?? .82) < DETAIL_ZOOM);
+        if (restored?.kind === "turn") pendingLocate.current = `turn:${restored.sessionId}:${restored.nativeTurnId}`;
         if (restored?.kind === "turn") setExpanded((current) => limitedExpansion(current, restored.sessionId));
         const next = await getForest(selectedWorkspace, controller.signal); setForest(next);
       } catch (error) { if (!controller.signal.aborted) setForestError((error as Error).message); }
@@ -99,11 +105,11 @@ export default function RealWorkspace() {
     if (!workspace) return;
     const saved = readWorkspaceState(localStorage, workspace);
     saveLastWorkspace(localStorage, workspace);
-    saveWorkspaceState(localStorage, workspace, { expandedSessionIds: [...expanded], positions, viewport, selection, railCollapsed, showNative });
+    saveWorkspaceState(localStorage, workspace, { expandedSessionIds: [...expanded], positions, viewport, selection, railCollapsed, showNative, overview });
     const path = updateMapUrl(new URL(location.href), workspace, selection);
     if (`${location.pathname}${location.search}` !== path) history.replaceState({}, "", path);
     if (saved.viewport && !viewport) setViewport(saved.viewport);
-  }, [workspace, expanded, positions, viewport, selection, railCollapsed, showNative]);
+  }, [workspace, expanded, positions, viewport, selection, railCollapsed, showNative, overview]);
 
   useEffect(() => {
     expandedRef.current = expanded;
@@ -149,11 +155,21 @@ export default function RealWorkspace() {
     window.addEventListener("keydown", listener); return () => window.removeEventListener("keydown", listener);
   });
 
-  const toggle = useCallback((sessionId: string) => setExpanded((current) => {
-    if (current.has(sessionId)) { const next = new Set(current); next.delete(sessionId); return next; }
-    return limitedExpansion(current, sessionId);
-  }), []);
-  const graph = useMemo(() => forest ? buildMapGraph({ forest, expanded, turnDirectories: turns, selection, positions, showNative, turnStates, onToggle: toggle, onRetryTurns: (sessionId) => void reloadTurnDirectory(sessionId).catch(() => undefined) }) : { nodes: [], edges: [], bounds: { width: 0, height: 0 } }, [forest, expanded, turns, selection, positions, showNative, turnStates, toggle, reloadTurnDirectory]);
+  const visibleExpanded = useMemo(() => overview ? new Set<string>() : expanded, [overview, expanded]);
+  const toggle = useCallback((sessionId: string) => {
+    if (overview) {
+      setOverview(false);
+      pendingLocate.current = `session:${sessionId}`;
+      setExpanded((current) => limitedExpansion(current, sessionId));
+      return;
+    }
+    if (!expanded.has(sessionId) && flow.getZoom() < DETAIL_ZOOM) pendingLocate.current = `session:${sessionId}`;
+    setExpanded((current) => {
+      if (current.has(sessionId)) { const next = new Set(current); next.delete(sessionId); return next; }
+      return limitedExpansion(current, sessionId);
+    });
+  }, [expanded, flow, overview]);
+  const graph = useMemo(() => forest ? buildMapGraph({ forest, expanded: visibleExpanded, turnDirectories: turns, selection, positions, showNative, turnStates, onToggle: toggle, onRetryTurns: (sessionId) => void reloadTurnDirectory(sessionId).catch(() => undefined) }) : { nodes: [], edges: [], bounds: { width: 0, height: 0 } }, [forest, visibleExpanded, turns, selection, positions, showNative, turnStates, toggle, reloadTurnDirectory]);
   const [renderNodes, setRenderNodes, onNodesChange] = useNodesState(graph.nodes);
   useEffect(() => setRenderNodes(graph.nodes), [graph.nodes, setRenderNodes]);
   useEffect(() => {
@@ -164,7 +180,11 @@ export default function RealWorkspace() {
     const parent = node.parentId ? renderNodes.find((item) => item.id === node.parentId) : undefined;
     const x = node.position.x + (parent?.position.x ?? 0) + (node.measured?.width ?? 236) / 2;
     const y = node.position.y + (parent?.position.y ?? 0) + (node.measured?.height ?? 56) / 2;
-    requestAnimationFrame(() => void flow.setCenter(x, y, { zoom: Math.max(flow.getZoom(), .78), duration: 280 }));
+    requestAnimationFrame(() => {
+      const zoom = Math.max(flow.getZoom(), .78);
+      const drawerWidth = document.querySelector(".detail-drawer")?.getBoundingClientRect().width ?? 0;
+      void flow.setCenter(x + drawerWidth / (2 * zoom), y, { zoom, duration: 280 });
+    });
   }, [renderNodes, flow]);
   useEffect(() => { if (viewport) void flow.setViewport(viewport); }, [workspace]);
   useEffect(() => {
@@ -172,11 +192,12 @@ export default function RealWorkspace() {
     fitUnseenWorkspace.current = false;
     requestAnimationFrame(() => void flow.fitView({ padding: .12 }).then(() => setViewport(flow.getViewport())));
   }, [renderNodes.length, flow]);
-
   const select = useCallback((next: Selection) => {
+    if (next) pendingLocate.current = next.kind === "turn" ? `turn:${next.sessionId}:${next.nativeTurnId}` : `session:${next.sessionId}`;
     setSelection(next);
-    if (next?.kind === "turn") setExpanded((current) => limitedExpansion(current, next.sessionId));
-  }, []);
+    if (next?.kind === "turn") { setOverview(false); setExpanded((current) => limitedExpansion(current, next.sessionId)); }
+    if (next?.kind === "turn" && flow.getZoom() < DETAIL_ZOOM) void flow.zoomTo(.78, { duration: 280 });
+  }, [flow]);
   const onNodeClick: NodeMouseHandler = useCallback((event, node) => {
     if (node.type === "session" && (event.target as HTMLElement).closest("[data-action='toggle-session']")) return toggle((node.data as any).session.sessionId);
     if (node.type === "session") select({ kind: "session", sessionId: (node.data as any).session.sessionId });
@@ -195,17 +216,21 @@ export default function RealWorkspace() {
     const navigation = resolveSearchNavigation(result, expanded, MAX_EXPANDED);
     pendingLocate.current = navigation.nodeId;
     setExpanded(navigation.expanded); setSelection(navigation.selection);
+    if (navigation.selection?.kind === "turn") setOverview(false);
+    if (navigation.selection?.kind === "turn" && flow.getZoom() < DETAIL_ZOOM) void flow.zoomTo(.78, { duration: 280 });
   }
 
   async function switchWorkspace(next: string) {
     if (!next || next === workspace) return;
     saveLastWorkspace(localStorage, next);
     const saved = readWorkspaceState(localStorage, next);
-    fitUnseenWorkspace.current = !saved.viewport;
+    fitUnseenWorkspace.current = !saved.viewport && saved.selection?.kind !== "turn";
     setWorkspace(next); setForest(undefined); setTurns(new Map()); setExpanded(new Set(saved.expandedSessionIds)); setPositions(saved.positions);
-    setSelection(saved.selection); setViewport(saved.viewport); setShowNative(Boolean(saved.showNative)); setRailCollapsed(Boolean(saved.railCollapsed));
+    setSelection(saved.selection); setViewport(viewportForSelection(saved.viewport, saved.selection)); setShowNative(Boolean(saved.showNative)); setRailCollapsed(Boolean(saved.railCollapsed));
+    setOverview(saved.selection?.kind === "turn" ? false : saved.overview ?? (saved.viewport?.zoom ?? .82) < DETAIL_ZOOM);
+    if (saved.selection?.kind === "turn") pendingLocate.current = `turn:${saved.selection.sessionId}:${saved.selection.nativeTurnId}`;
     await reloadForest(next);
-    if (saved.viewport) await flow.setViewport(saved.viewport);
+    if (saved.viewport) await flow.setViewport(viewportForSelection(saved.viewport, saved.selection)!);
   }
   async function confirmPlacement() {
     if (!placement) return;
@@ -254,6 +279,11 @@ export default function RealWorkspace() {
     } catch (error) { setNotice((error as Error).message); }
   }
   const sessions = forest ? flattenSessions([...forest.roots, ...forest.unorganized]) : [];
+  const railSessions = railView === "unorganized"
+    ? forest?.unorganized ?? []
+    : railView === "recent"
+      ? [...sessions].sort((a, b) => (Date.parse(b.updatedAt ?? "") || 0) - (Date.parse(a.updatedAt ?? "") || 0))
+      : sessions;
   const selectedNode = selection ? sessions.find((session) => session.sessionId === selection.sessionId) : undefined;
   const legacyPath = selection?.kind === "turn"
     ? `/workspaces/${encodeURIComponent(workspace)}/sessions/${encodeURIComponent(selection.sessionId)}/turns/${encodeURIComponent(selection.nativeTurnId)}`
@@ -273,12 +303,13 @@ export default function RealWorkspace() {
     <aside className="workspace-rail">
       <button type="button" className="rail-toggle" onClick={() => setRailCollapsed((value) => !value)}>{railCollapsed ? "›" : "‹"}</button>
       <h2>Workspace</h2><p>{forest?.stats.confirmedRoots ?? 0} roots · {forest?.stats.sessions ?? 0} Sessions</p>
-      <nav><button className="active" type="button">Work evolution</button><button type="button">Recent</button><button type="button">Not organized yet <span>{forest?.stats.unorganized ?? 0}</span></button></nav>
-      <div className="rail-sessions">{sessions.slice(0, 12).map((session) => <button type="button" className={selection?.sessionId === session.sessionId ? "selected" : ""} key={session.sessionId} onClick={() => select({ kind: "session", sessionId: session.sessionId })}>{session.displayTitle}</button>)}</div>
+      <nav aria-label="Session list views"><button className={railView === "work" ? "active" : ""} aria-pressed={railView === "work"} type="button" onClick={() => setRailView("work")}>Work evolution</button><button className={railView === "recent" ? "active" : ""} aria-pressed={railView === "recent"} type="button" onClick={() => setRailView("recent")}>Recent</button><button className={railView === "unorganized" ? "active" : ""} aria-pressed={railView === "unorganized"} type="button" onClick={() => setRailView("unorganized")}>Not organized yet <span>{forest?.stats.unorganized ?? 0}</span></button></nav>
+      <div className="rail-sessions">{railSessions.length ? railSessions.map((session) => <button type="button" className={selection?.sessionId === session.sessionId ? "selected" : ""} key={session.sessionId} onClick={() => select({ kind: "session", sessionId: session.sessionId })}>{session.displayTitle}</button>) : <p className="rail-empty">{railView === "unorganized" ? "All Sessions are organized." : "No Sessions in this Workspace."}</p>}</div>
       <div className="legend"><h3>Map connections</h3><p><i className="solid" /> Your placement</p><p><i className="dashed" /> AI suggestion</p><p><i className="native" /> Original branch source</p></div>
     </aside>
     <section className="map-stage" aria-label="Session–Turn Work Evolution Map">
-      <div className="map-toolbar"><div><strong>Work evolution</strong><span>{forest?.stats.confirmedRoots ?? 0} roots · {forest?.stats.sessions ?? 0} Sessions · {expanded.size} expanded</span></div><label><input type="checkbox" checked={showNative} onChange={(event) => setShowNative(event.target.checked)} /> Show original branch source</label><button type="button" onClick={() => void flow.fitView({ padding: .12, duration: 300 }).then(() => setViewport(flow.getViewport()))}>Fit view</button></div>
+      <div className="map-toolbar"><div><strong>Work evolution</strong><span>{forest?.stats.confirmedRoots ?? 0} roots · {forest?.stats.sessions ?? 0} Sessions · {overview ? "Session overview" : `${expanded.size} expanded`}</span></div><button type="button" aria-pressed={overview} onClick={() => { setOverview((value) => !value); if (overview && flow.getZoom() < DETAIL_ZOOM) void flow.zoomTo(.78, { duration: 280 }); }}>{overview ? "Show expanded Turns" : "Session overview"}</button><label><input type="checkbox" checked={showNative} onChange={(event) => setShowNative(event.target.checked)} /> Show original branch source</label><button type="button" onClick={() => void flow.fitView({ padding: .12, duration: 300 }).then(() => setViewport(flow.getViewport()))}>Fit view</button></div>
+      {overview && <div className="map-zoom-hint">Session overview · Use + on a Session to read its Turns</div>}
       {loading && <div className="map-centered-state"><strong>Preparing your local Codex history…</strong><span>Original Codex history is not modified.</span></div>}
       <FirstUseNotice />
       {showGuide && <FirstUseNotice forceVisible onDismiss={() => setShowGuide(false)} />}
@@ -291,7 +322,7 @@ export default function RealWorkspace() {
       ><Background gap={26} size={1} color="#dbe2dc" /><MiniMap pannable zoomable nodeStrokeWidth={3} /><Controls showInteractive={false} /></ReactFlow>}
       <output className="map-notice">{notice}{lastEdit && <button type="button" onClick={() => void performUndo()}>Undo</button>}</output>
     </section>
-    {selection && <DetailDrawer selection={selection} session={selectedNode} turn={selection.kind === "turn" ? turns.get(selection.sessionId)?.find((item) => item.nativeTurnId === selection.nativeTurnId) : undefined} directory={selection.kind === "turn" ? turns.get(selection.sessionId) ?? [] : []} detail={detail} error={detailError} onNavigateTurn={(turn: TurnDirectoryItem) => select({ kind: "turn", sessionId: selection.sessionId, nativeTurnId: turn.nativeTurnId })} draft={draft} setDraft={setDraft} saveDraft={saveDraft} restoreAutomatic={restoreAutomatic} setRoot={setRoot} close={() => setSelection(undefined)} beginMove={async () => {
+    {selection && <DetailDrawer selection={selection} session={selectedNode} turn={selection.kind === "turn" ? turns.get(selection.sessionId)?.find((item) => item.nativeTurnId === selection.nativeTurnId) : undefined} directory={selection.kind === "turn" ? turns.get(selection.sessionId) ?? [] : []} detail={detail} error={detailError} onNavigateTurn={(turn: TurnDirectoryItem) => select({ kind: "turn", sessionId: selection.sessionId, nativeTurnId: turn.nativeTurnId })} draft={draft} setDraft={setDraft} saveDraft={saveDraft} restoreAutomatic={restoreAutomatic} setRoot={setRoot} close={() => setSelection(undefined)} onNotice={setNotice} locationUrl={new URL(updateMapUrl(new URL(location.href), workspace, selection), location.origin).toString()} beginMove={async () => {
       try { const candidates = await getManualParents(selection.sessionId); setPlacement({ childSessionId: selection.sessionId, parentSessionId: candidates[0]?.sessionId ?? "", relation: selectedNode?.semanticRelation === "continuation" ? "continuation" : "subtask", legalParentIds: candidates.map((candidate) => candidate.sessionId) }); }
       catch (error) { setNotice((error as Error).message); }
     }} />}
@@ -302,9 +333,23 @@ export default function RealWorkspace() {
 function DetailDrawer(props: any) {
   const title = props.selection.kind === "turn" ? props.detail?.semanticTrace?.navigationLabel ?? props.turn?.displayLabel ?? `Turn ${props.selection.nativeTurnId}` : props.detail?.semanticTitle?.displayTitle ?? props.session?.displayTitle;
   const heading = props.selection.kind === "turn" && props.turn ? `T${props.turn.displayOrdinal} · ${title}` : title;
+  async function copy(value: string, label: string) {
+    try { await navigator.clipboard.writeText(value); props.onNotice(`${label} copied`); }
+    catch { props.onNotice("Clipboard access failed. Check browser permissions and try again."); }
+  }
+  const turnContext = props.selection.kind === "turn" && props.detail ? [
+    `Session: ${props.session?.displayTitle ?? props.selection.sessionId}`,
+    `Session ID: ${props.selection.sessionId}`,
+    `Turn ID: ${props.selection.nativeTurnId}`,
+    `Location: ${props.locationUrl}`,
+    props.detail.semanticTrace?.displayText ? `Summary (AI suggestion):\n${props.detail.semanticTrace.displayText}` : "",
+    `User input:\n${props.detail.input ?? ""}`,
+    `Assistant final:\n${props.detail.assistantFinal ?? ""}`,
+  ].filter(Boolean).join("\n\n") : "";
   return <aside className="detail-drawer"><button type="button" className="drawer-close" aria-label="Close detail" onClick={props.close}>×</button><span className="drawer-kicker">{props.selection.kind === "turn" ? "Turn details" : "Session details"}</span><h2>{heading ?? "Loading…"}</h2>
     {props.error && props.selection.kind === "session" && <p className="drawer-error">{props.error} <button type="button" onClick={props.close}>Close</button></p>}
-    {props.selection.kind === "session" ? <><p>{formatPlacement(props.detail?.semanticParent)}</p><dl><dt>Turns</dt><dd>{props.session?.turnCount}</dd><dt>Original title</dt><dd>{props.detail?.semanticTitle?.originalTitle ?? props.session?.originalTitle}</dd><dt>Related Turn</dt><dd>{props.detail?.semanticParent?.anchorTurnId ?? "Session level"}</dd><dt>Original branch source</dt><dd>{props.detail?.semanticParent?.nativeLineage?.originTurnId ?? "None"}</dd></dl></> : <TurnReader nativeTurnId={props.selection.nativeTurnId} directory={props.directory} detail={props.detail} error={props.error} onNavigate={props.onNavigateTurn} />}
+    {props.selection.kind === "session" ? <><p>{formatPlacement(props.detail?.semanticParent)}</p><dl><dt>Turns</dt><dd>{props.session?.turnCount}</dd><dt>Original title</dt><dd>{props.detail?.semanticTitle?.originalTitle ?? props.session?.originalTitle}</dd><dt>Related Turn</dt><dd>{props.detail?.semanticParent?.anchorTurnId ?? "Session level"}</dd><dt>Original branch source</dt><dd>{props.detail?.semanticParent?.nativeLineage?.originTurnId ?? "None"}</dd></dl>{props.detail?.semanticParent?.generatedReason && <p className="placement-reason"><strong>{props.detail.semanticParent.authority === "user" ? "Earlier AI suggestion: " : "Why AI suggested this: "}</strong>{props.detail.semanticParent.generatedReason}</p>}</> : <TurnReader nativeTurnId={props.selection.nativeTurnId} directory={props.directory} detail={props.detail} error={props.error} onNavigate={props.onNavigateTurn} />}
+    <div className="drawer-copy-actions"><button type="button" onClick={() => void copy(props.selection.sessionId, "Session ID")}>Copy Session ID</button><button type="button" onClick={() => void copy(props.locationUrl, "Location link")}>Copy location link</button>{props.selection.kind === "turn" && <button type="button" disabled={!props.detail} onClick={() => void copy(turnContext, "Turn context")}>Copy Turn context</button>}</div>
     {props.draft ? <div className="drawer-edit"><textarea autoFocus value={props.draft.value} onChange={(event) => props.setDraft({ ...props.draft, value: event.target.value })} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void props.saveDraft(); } }} /><button type="button" onClick={props.saveDraft}>Save</button><button type="button" onClick={() => props.setDraft(undefined)}>Cancel</button></div> : <div className="drawer-actions">
       <button type="button" onClick={() => props.setDraft({ kind: props.selection.kind === "turn" ? "label" : "title", value: title ?? "" })}>{props.selection.kind === "turn" ? "Edit label" : "Rename"}</button>
       {props.selection.kind === "session" && <><button type="button" onClick={props.beginMove}>Move</button><button type="button" onClick={() => props.setRoot(props.selection.sessionId)}>Set root</button></>}
@@ -331,4 +376,8 @@ function PlacementPanel(props: any) {
 function limitedExpansion(current: ReadonlySet<string>, sessionId: string): Set<string> {
   const values = [...current].filter((value) => value !== sessionId); values.push(sessionId);
   return new Set(values.slice(-MAX_EXPANDED));
+}
+
+function viewportForSelection(viewport: PersistedWorkspaceState["viewport"], selection?: Selection): PersistedWorkspaceState["viewport"] {
+  return viewport && selection?.kind === "turn" && viewport.zoom < DETAIL_ZOOM ? { ...viewport, zoom: .78 } : viewport;
 }

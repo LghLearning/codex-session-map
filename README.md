@@ -73,17 +73,19 @@ Typical transcript viewers help inspect individual Sessions. Codex Session Map f
 
 ## Quick Start
 
-The verified Beta path is Windows with Node.js 24 or newer:
+The verified Beta path is Windows. You need Node.js 24 or newer, pnpm 11.19.0 through Corepack, and an existing local Codex installation with at least one Session. The repository has a double-click launcher, but no standalone installer or executable yet.
+
+Clone the repository, or download **Code → Download ZIP** on GitHub and extract it. Open PowerShell in the extracted `codex-session-map` folder. For a clone:
 
 ```powershell
 git clone https://github.com/LghLearning/codex-session-map.git
 cd codex-session-map
 corepack enable
 pnpm install --frozen-lockfile
-.\start-session-map.ps1
+.\start-session-map.cmd
 ```
 
-Open [http://127.0.0.1:4319](http://127.0.0.1:4319) if the launcher does not open the browser. The default page is the React Map Workspace; the retained legacy Explorer is available at `/legacy`.
+For a ZIP download, run `corepack enable` and `pnpm install --frozen-lockfile` in its extracted folder. After installation, double-click `start-session-map.cmd` in File Explorer, or run it from PowerShell as above. Windows may open `.ps1` files in an editor when double-clicked; the `.cmd` file runs the PowerShell launcher for you. The first install downloads dependencies. The launcher builds the Map Workspace, starts a local read-only server, and opens [http://127.0.0.1:4319](http://127.0.0.1:4319). Keep its terminal window open while using the app; press Ctrl+C to stop it. The default page is the React Map Workspace; the retained legacy Explorer is available at `/legacy`.
 
 Ollama is optional. Map, Search, Reader, and manual organization work without AI. Add Ollama only when you want local generation:
 
@@ -92,7 +94,7 @@ ollama pull qwen3.5
 ollama serve
 ```
 
-Useful launcher options include `-NoBrowser`, `-Fallback`, `-Port 4321`, and `-NodePath C:\path\to\node.exe`.
+Useful PowerShell launcher options include `-NoBrowser`, `-Fallback`, `-Port 4321`, and `-NodePath C:\path\to\node.exe`. Run them with `powershell -ExecutionPolicy Bypass -File .\start-session-map.ps1 -Port 4321`. The launcher checks available Node executables and uses the first version 24 or newer. If it cannot find one, install Node 24 or pass its full `node.exe` path with `-NodePath`.
 
 ## How it works
 

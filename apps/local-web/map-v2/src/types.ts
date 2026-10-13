@@ -53,6 +53,7 @@ export interface PersistedWorkspaceState {
   selection?: Selection;
   railCollapsed?: boolean;
   showNative?: boolean;
+  overview?: boolean;
 }
 
 export interface SessionMapNodeData extends Record<string, unknown> {

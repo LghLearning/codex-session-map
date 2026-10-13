@@ -13,6 +13,7 @@ export function readWorkspaceState(storage: Pick<Storage, "getItem">, workspace:
       viewport: validViewport(parsed.viewport) ? parsed.viewport : undefined,
       selection: validSelection(parsed.selection) ? parsed.selection : undefined,
       railCollapsed: Boolean(parsed.railCollapsed), showNative: Boolean(parsed.showNative),
+      overview: typeof parsed.overview === "boolean" ? parsed.overview : undefined,
     };
   } catch { return { expandedSessionIds: [], positions: {} }; }
 }

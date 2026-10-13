@@ -16,12 +16,13 @@ test("URL selection takes precedence and round-trips workspace, Session and nati
 test("workspace state restores viewport, selection and bounded expanded Sessions", () => {
   const values = new Map<string, string>();
   const storage = { getItem: (key: string) => values.get(key) ?? null, setItem: (key: string, value: string) => void values.set(key, value) };
-  saveWorkspaceState(storage, "w", { expandedSessionIds: Array.from({ length: 20 }, (_, index) => `s${index}`), positions: { "session:a": { x: 9, y: 7 } }, viewport: { x: 3, y: 4, zoom: .8 }, selection: { kind: "session", sessionId: "a" }, railCollapsed: true });
+  saveWorkspaceState(storage, "w", { expandedSessionIds: Array.from({ length: 20 }, (_, index) => `s${index}`), positions: { "session:a": { x: 9, y: 7 } }, viewport: { x: 3, y: 4, zoom: .8 }, selection: { kind: "session", sessionId: "a" }, railCollapsed: true, overview: true });
   const restored = readWorkspaceState(storage, "w");
   assert.equal(restored.expandedSessionIds.length, 12);
   assert.deepEqual(restored.positions["session:a"], { x: 9, y: 7 });
   assert.deepEqual(restored.viewport, { x: 3, y: 4, zoom: .8 });
   assert.deepEqual(restored.selection, { kind: "session", sessionId: "a" });
+  assert.equal(restored.overview, true);
   saveLastWorkspace(storage, "w");
   assert.equal(readLastWorkspace(storage), "w");
 });
